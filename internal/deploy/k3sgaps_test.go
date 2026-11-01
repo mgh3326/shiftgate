@@ -676,7 +676,9 @@ func TestCheckIntentWrittenDuringProbe(t *testing.T) {
 			}
 		}
 		r, err := checkOne(t, h, false)
-		lk.Unlock()
+		if lk != nil { // only the held iteration takes the lock
+			lk.Unlock()
+		}
 		if held {
 			if err != nil || r.Skipped == "" {
 				t.Fatalf("live flip during the probe should skip: %+v %v", r, err)
