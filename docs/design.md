@@ -13,16 +13,22 @@ onto shiftgate.
 |---|---|---|---|---|
 | `services.yaml` | operator | every command | the operator (by hand) | file in version control or config management |
 | `<state_dir>/<svc>/state.json` | shiftgate | every command | deploy, rollback, recover | temp file, fsync, rename, fsync the directory |
-| `<state_dir>/<svc>/swaps.log` | shiftgate | people, audit | deploy, rollback, recover | append-only JSON lines, fsync per line |
+| `<state_dir>/<svc>/swaps.log` | shiftgate | people, audit, `status` (`last_op`) | deploy, rollback, recover, `check --heal` | append-only JSON lines, fsync per line |
+| `<state_dir>/<svc>/ops/<op_id>.log` | shiftgate | people | deploy (`pre_deploy` output) | mode 0600, capped at 1 MiB, newest 20 kept |
 | `<state_dir>/host.lock`, `<svc>/lock` | shiftgate | — | every mutating command | `flock(2)`; the kernel releases it if the process dies |
 | generated `haproxy.cfg` | shiftgate | HAProxy | `render`, and the post-commit sync | validated with `haproxy -c` before install |
 | HAProxy runtime state (admin socket) | HAProxy | deploy, rollback, recover, status | deploy, rollback, recover | memory only; lost on reload |
-| Containers `shiftgate-<svc>-<colour>` | Docker | every command | deploy, rollback | labelled `shiftgate.service`, `shiftgate.color`, `shiftgate.digest` |
+| Containers `shiftgate-<svc>-<colour>` | Docker | every command | deploy, rollback, `check --heal` (restart only) | labelled `shiftgate.service`, `shiftgate.color`, `shiftgate.digest` |
+| Container `shiftgate-<svc>-pre-deploy` | Docker | deploy | deploy | one-shot (`--rm`), labelled `shiftgate.service`, `shiftgate.role=pre_deploy`, `shiftgate.digest` |
+| Registry tag → digest | the registry | `follow` | CI (push) | read with an anonymous or `registry_auth_file` bearer token |
 
 `state.json` holds the **committed** deployment identity: `active`
 (colour and digest), `previous`, `rollback_available`, `history` (promoted
 digests, newest first, used by prune), `generation`, `last_swap_at`,
-`last_op`, `last_result` and `last_error`. It also holds `pending`: the
+`last_op`, `last_result` and `last_error`, and `hold`: a digest `follow`
+must not deploy (the one a rollback moved away from, or one whose followed
+deploy failed), released when the tag points at another digest or the
+digest is deployed explicitly. It also holds `pending`: the
 journal of an operation that has not committed. `pending` records the
 operation id, the operation, the phase (`starting` or `flipping`), the from
 and to slots, and the start time. HAProxy reports what is actually being
@@ -39,8 +45,13 @@ stateDiagram-v2
     [*] --> Locked: host lock (shared) + service lock (exclusive, no wait)
     Locked --> Refused: pending intent / no state but containers exist / backend missing in HAProxy
     Locked --> Starting: write intent (phase starting); invalidate rollback if the target slot is the previous colour
-    Starting --> Aborted: pull / run fails
-    Starting --> Health: container running
+    Starting --> Aborted: pull fails
+    Starting --> PreDeploy: pulled, service has pre_deploy
+    PreDeploy --> Aborted: non-zero exit / timeout (target slot untouched, rollback kept)
+    PreDeploy --> Run: exit 0 (output in ops/<op_id>.log)
+    Starting --> Run: pulled, no pre_deploy
+    Run --> Aborted: run fails
+    Run --> Health: container running
     Health --> Aborted: health timeout (HAProxy untouched, target stopped)
     Health --> Flipping: write intent (phase flipping)
     Flipping --> TargetUp: set target ready, read back until ready and UP
@@ -159,6 +170,29 @@ and 3.1.
 | Concurrent deploy protection | per-service `flock` | covered (new) |
 | Swap log | `swaps.log` JSON lines | covered (new; auto_trader keeps only digest files) |
 
+## follow and check
+
+`follow <svc> --tag <tag>` asks the registry for the tag's digest before it
+takes any lock, then takes the same host and service locks as `deploy`
+(so it exits 75 while another operation runs) and decides under them:
+equal to `active` → nothing; equal to `hold` → nothing; otherwise the hold
+is released and the normal deploy runs in the same session. A followed
+deploy that aborts holds its digest, except after `pull_failed` or
+`intent_write_failed`, which say nothing about the image.
+
+`check [<svc>] [--heal]` reads `state.json` without a lock. A pending
+intent is reported as a failure only if no process holds the service lock;
+otherwise an operation is running and the service is skipped. It then
+checks the active colour's container (exists, shiftgate's, the active
+digest, running), the health endpoint (`health.timeout`) and HAProxy (ready
+and UP). If a probe fails but `generation` changed meanwhile, a deploy
+committed during the check and the service is skipped. `--heal` restarts
+the active container only for a stopped container, a failed health check
+or HAProxy DOWN, under the host and service locks, once, and only if
+`generation` and `active` are unchanged; it then re-checks, giving HAProxy
+up to the flip timeout to see the server UP. It never sends a runtime-API
+command and never writes `state.json`.
+
 ## Advisories and non-goals
 
 - **Drain blocks the CLI.** A long `drain_timeout` (the adopter's MCP uses
@@ -176,5 +210,18 @@ and 3.1.
   mid-write can leave a partial file. `haproxy.cfg.previous` is written
   first, the running HAProxy keeps its loaded config, and the next
   `render` rewrites the file.
+- **`check` is not a probe loop.** It runs when the scheduler runs it
+  (typically once a minute) and restarts at most once per run, with no
+  backoff. A container that hangs again right after each restart is
+  restarted every run; the restart trail is in `swaps.log` and the
+  `shiftgate_last_op_ok` metric.
+- **`follow` polls one tag.** It notices a push within its schedule, and
+  for a multi-arch tag it deploys the index digest. A digest deployed by
+  hand that the tag does not point at is replaced by the tag's digest on
+  the next run (unless that digest is held): stop the follow job while
+  running a hand-picked version.
+- **`pre_deploy` shares the old colour's database.** It runs while the old
+  colour serves, so its changes must be compatible with the running
+  version.
 - **No reconstruction from a digest.** When the previous container is gone,
   rollback is refused; deploy the old digest explicitly instead.

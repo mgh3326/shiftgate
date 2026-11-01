@@ -1,0 +1,14 @@
+# Dagu DAG (example): check every service each minute, restart a hung
+# active container once, and ping healthchecks (/fail when anything is
+# still failing). It runs independently of follow on purpose: a failed
+# deploy must not stop the monitor. check skips a service while a deploy
+# holds its lock.
+#
+# /etc/shiftgate/dagu.env (mode 0600):
+#   HC_PING_URL=https://hc-ping.example/<uuid>
+schedule: "* * * * *"
+max_active_runs: 1
+dotenv: /etc/shiftgate/dagu.env
+steps:
+  - name: check
+    run: shiftgate check --heal --ping-url-env HC_PING_URL

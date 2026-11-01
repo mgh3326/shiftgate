@@ -1,0 +1,12 @@
+# Dagu DAG (example; Dagu 2.x field names, checked with 2.21): deploy the
+# newest image pushed to ghcr.io/example/web:main. Copy one file per
+# followed service into the host's Dagu DAGs directory.
+schedule: "* * * * *"
+max_active_runs: 1
+steps:
+  - name: follow
+    run: shiftgate follow web --tag main
+    continue_on:
+      # 75: another operation holds the lock; the next run retries.
+      exit_code: [75]
+      mark_success: true

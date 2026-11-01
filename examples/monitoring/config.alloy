@@ -1,0 +1,22 @@
+// Grafana Alloy (example): expose shiftgate's status metrics written by
+// shiftgate-textfile.sh and send them to a Prometheus-compatible endpoint.
+// See docs/monitoring.md. Replace the remote_write URL with your own.
+prometheus.exporter.unix "shiftgate" {
+  set_collectors = ["textfile"]
+
+  textfile {
+    directory = "/var/lib/alloy/textfile"
+  }
+}
+
+prometheus.scrape "shiftgate" {
+  targets         = prometheus.exporter.unix.shiftgate.targets
+  scrape_interval = "60s"
+  forward_to      = [prometheus.remote_write.default.receiver]
+}
+
+prometheus.remote_write "default" {
+  endpoint {
+    url = "https://prometheus.example/api/v1/write"
+  }
+}

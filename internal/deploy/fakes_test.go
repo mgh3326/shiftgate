@@ -3,6 +3,7 @@ package deploy_test
 import (
 	"context"
 	"fmt"
+	"io"
 	"net"
 	"os"
 	"path/filepath"
@@ -32,12 +33,22 @@ type fakeDocker struct {
 	pullErr    error
 	// exitAfterRun makes a new container stop right after it starts.
 	exitAfterRun bool
+	// runOnceErr is returned by RunOnce (pre_deploy); runOnceOut is written.
+	runOnceErr  error
+	runOnceOut  string
+	runOnceSeen []docker.RunSpec
+	// restartErr fails Restart; restartKeepsHung leaves a hung container hung.
+	restartErr       error
+	restartKeepsHung bool
 }
 
 type fakeCtr struct {
-	labels  map[string]string
-	running bool
-	port    int
+	labels   map[string]string
+	running  bool
+	port     int
+	hung     bool // running but its health endpoint does not answer
+	restarts int
+	spec     docker.RunSpec
 }
 
 func newFakeDocker() *fakeDocker {
@@ -82,8 +93,54 @@ func (d *fakeDocker) Run(ctx context.Context, spec docker.RunSpec) error {
 	} else {
 		hostPort, _ = strconv.Atoi(spec.Env["PORT"])
 	}
-	d.containers[spec.Name] = &fakeCtr{labels: spec.Labels, running: !d.exitAfterRun, port: hostPort}
+	d.containers[spec.Name] = &fakeCtr{labels: spec.Labels, running: !d.exitAfterRun, port: hostPort, spec: spec}
 	return nil
+}
+
+func (d *fakeDocker) RunOnce(ctx context.Context, spec docker.RunSpec, out io.Writer) error {
+	d.record("runonce " + spec.Name)
+	d.mu.Lock()
+	d.runOnceSeen = append(d.runOnceSeen, spec)
+	msg, err := d.runOnceOut, d.runOnceErr
+	d.mu.Unlock()
+	io.WriteString(out, msg)
+	return err
+}
+
+func (d *fakeDocker) Restart(ctx context.Context, name string, _ time.Duration) error {
+	d.record("restart " + name)
+	d.mu.Lock()
+	defer d.mu.Unlock()
+	if d.restartErr != nil {
+		return d.restartErr
+	}
+	c, ok := d.containers[name]
+	if !ok {
+		return fmt.Errorf("no such container")
+	}
+	c.running, c.restarts = true, c.restarts+1
+	if !d.restartKeepsHung {
+		c.hung = false
+	}
+	return nil
+}
+
+func (d *fakeDocker) set(name string, fn func(*fakeCtr)) {
+	d.mu.Lock()
+	defer d.mu.Unlock()
+	fn(d.containers[name])
+}
+
+func (d *fakeDocker) callsWith(prefix string) []string {
+	d.mu.Lock()
+	defer d.mu.Unlock()
+	var out []string
+	for _, c := range d.calls {
+		if strings.HasPrefix(c, prefix) {
+			out = append(out, c)
+		}
+	}
+	return out
 }
 
 func (d *fakeDocker) Start(ctx context.Context, name string) error {
@@ -128,7 +185,9 @@ func (d *fakeDocker) Inspect(ctx context.Context, name string) (docker.Container
 	if !ok {
 		return docker.Container{}, false, nil
 	}
-	return docker.Container{ID: name, Running: c.running, Labels: c.labels}, true, nil
+	status := map[bool]string{true: "running", false: "exited"}[c.running]
+	return docker.Container{ID: name, Running: c.running, Status: status, Labels: c.labels,
+		StartedAt: time.Date(2026, 11, 1, 0, 0, 0, 0, time.UTC), RestartCount: c.restarts}, true, nil
 }
 
 func (d *fakeDocker) ImageDigests(ctx context.Context, repo string) ([]string, error) {
@@ -193,6 +252,9 @@ func (h *fakeHealth) Probe(ctx context.Context, _ config.Health, addr string) er
 	}
 	for _, c := range h.d.containers {
 		if c.port == port && c.running {
+			if c.hung {
+				return fmt.Errorf("context deadline exceeded")
+			}
 			if h.bad[c.labels[docker.LabelDigest]] {
 				return fmt.Errorf("status 503")
 			}
