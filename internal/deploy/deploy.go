@@ -81,8 +81,10 @@ type Gate struct {
 	Docker docker.Engine
 	Router haproxy.Router
 	Health health.Checker
-	Log    io.Writer
-	Now    func() time.Time
+	// Registry resolves tags for `follow`; nil disables follow.
+	Registry Resolver
+	Log      io.Writer
+	Now      func() time.Time
 
 	// Poll is the runtime-API read-back interval (default 250ms).
 	Poll time.Duration
@@ -156,6 +158,9 @@ type session struct {
 	svc   *config.Service
 	cur   *state.State
 	locks []*state.Lock
+	// aborted is the recorded result of an operation abort ended (and its
+	// op id), so callers can tell an aborted operation from a refusal.
+	aborted, abortedOp string
 }
 
 func (s *session) release() {
@@ -246,7 +251,13 @@ func (g *Gate) Deploy(ctx context.Context, name, digest string) (*Result, error)
 	if err := g.requirePending(ss); err != nil {
 		return nil, err
 	}
-	svc, cur := ss.svc, ss.cur
+	return g.deployLocked(ctx, ss, digest)
+}
+
+// deployLocked runs a deploy inside a session that holds the locks and has
+// no pending intent.
+func (g *Gate) deployLocked(ctx context.Context, ss *session, digest string) (*Result, error) {
+	svc, cur, name := ss.svc, ss.cur, ss.svc.Name
 	if err := g.precheck(ctx, svc); err != nil {
 		return nil, err
 	}
@@ -272,6 +283,13 @@ func (g *Gate) Deploy(ctx context.Context, name, digest string) (*Result, error)
 	ref := svc.Image + "@" + digest
 	if err := g.Docker.Pull(ctx, ref); err != nil {
 		return nil, g.abort(ss, "pull_failed", err, false)
+	}
+	// pre_deploy runs while the old colour serves and before the target
+	// slot is touched, so a failure leaves routing and rollback intact.
+	if svc.PreDeploy != nil {
+		if err := g.preDeploy(ctx, ss, digest); err != nil {
+			return nil, g.abort(ss, "pre_deploy_failed", err, false)
+		}
 	}
 	// The target slot is the previous colour: once its container is
 	// replaced, rollback to it is impossible. Record that durably right
@@ -378,6 +396,7 @@ func (g *Gate) abort(ss *session, result string, cause error, stopTarget bool) e
 	}
 	cur.Pending = nil
 	cur.LastOp, cur.LastResult, cur.LastError = op.Op, result, cause.Error()
+	ss.aborted, ss.abortedOp = result, op.OpID
 	if err := g.Store.Save(cur); err != nil {
 		return fail(CodeRecovery, "%s: %v; and clearing the intent failed: %v", result, cause, err)
 	}
@@ -387,7 +406,7 @@ func (g *Gate) abort(ss *session, result string, cause error, stopTarget bool) e
 
 func (g *Gate) audit(svc *config.Service, op *state.Intent, result string, cause error, warnings []string) {
 	r := state.SwapRecord{Time: g.now(), OpID: op.OpID, Service: svc.Name, Op: op.Op,
-		ToColor: op.To.Color, ToDigest: op.To.Digest, Result: result, Warnings: warnings}
+		ToColor: op.To.Color, ToDigest: op.To.Digest, Result: result, Warnings: warnings, OpLog: op.OpLog}
 	if op.From != nil {
 		r.FromColor, r.FromDigest = op.From.Color, op.From.Digest
 	}
@@ -486,6 +505,13 @@ func (g *Gate) commit(ctx context.Context, ss *session) (*Result, error) {
 	cur.Generation++
 	cur.LastSwapAt = g.now()
 	cur.LastOp, cur.LastResult, cur.LastError = op.Op, "ok", ""
+	switch {
+	case op.Op == "rollback" && op.From != nil:
+		// follow must not bring back the digest that was just rolled back.
+		cur.Hold = &state.Hold{Digest: op.From.Digest, Reason: "rolled_back", OpID: op.OpID, At: g.now()}
+	case cur.Hold != nil && cur.Hold.Digest == to.Digest:
+		cur.Hold = nil // the held digest was deployed on purpose
+	}
 	cur.Pending = nil
 	if err := g.Store.Save(cur); err != nil {
 		return nil, fail(CodeRecovery, "%s %s: traffic moved to %s but the commit write failed: %v; run `shiftgate recover %s`",
@@ -640,6 +666,7 @@ func RunSpec(svc *config.Service, c config.Color, digest string) docker.RunSpec 
 		EnvFiles: svc.EnvFiles,
 		Env:      map[string]string{},
 		RunArgs:  svc.RunArgs,
+		LogOpts:  logOpts(svc.Log),
 	}
 	if svc.Network == "host" {
 		port = svc.Port(c)
@@ -656,4 +683,93 @@ func RunSpec(svc *config.Service, c config.Color, digest string) docker.RunSpec 
 		spec.Args = append(spec.Args, expand(a))
 	}
 	return spec
+}
+
+func logOpts(l config.LogOptions) []string {
+	return []string{"max-size=" + l.MaxSize, "max-file=" + strconv.Itoa(l.MaxFile)}
+}
+
+// PreDeploySpec is the one-shot pre_deploy container for a deploy of colour
+// c at digest: the same image, env files, env and network as the colour,
+// no published port, no restart policy, removed when it exits.
+func PreDeploySpec(svc *config.Service, c config.Color, digest string) docker.RunSpec {
+	spec := RunSpec(svc, c, digest)
+	spec.Name = svc.PreDeployName()
+	spec.OneShot = true
+	spec.Publish = ""
+	spec.Labels = map[string]string{
+		docker.LabelService: svc.Name,
+		docker.LabelRole:    "pre_deploy",
+		docker.LabelDigest:  digest,
+	}
+	port := spec.Env["PORT"]
+	expand := strings.NewReplacer("{port}", port, "{color}", string(c)).Replace
+	spec.Args = nil
+	for _, a := range svc.PreDeploy.Args {
+		spec.Args = append(spec.Args, expand(a))
+	}
+	return spec
+}
+
+// maxOpLog caps the captured pre_deploy output.
+const maxOpLog = 1 << 20
+
+// preDeploy runs svc.PreDeploy to completion with the new image, writing its
+// output to the operation's log file.
+func (g *Gate) preDeploy(ctx context.Context, ss *session, digest string) error {
+	svc, op := ss.svc, ss.cur.Pending
+	spec := PreDeploySpec(svc, op.To.Color, digest)
+	if c, ok, err := g.Docker.Inspect(ctx, spec.Name); err != nil {
+		return fmt.Errorf("inspect %s: %w", spec.Name, err)
+	} else if ok {
+		if c.Labels[docker.LabelService] != svc.Name || c.Labels[docker.LabelRole] != "pre_deploy" {
+			return fmt.Errorf("container %s exists but is not shiftgate's pre_deploy container of %s; refusing to replace it", spec.Name, svc.Name)
+		}
+		if c.Running {
+			return fmt.Errorf("pre_deploy container %s is still running from an earlier operation; stop it first", spec.Name)
+		}
+		_ = g.Docker.Remove(ctx, spec.Name) // leftover of an interrupted run
+	}
+	f, err := g.Store.CreateOpLog(svc.Name, op.OpID)
+	if err != nil {
+		return fmt.Errorf("create op log: %w", err)
+	}
+	defer f.Close()
+	op.OpLog = f.Name()
+	g.logf("%s: pre_deploy %s (output in %s)", svc.Name, strings.Join(svc.PreDeploy.Args, " "), op.OpLog)
+	rctx, cancel := context.WithTimeout(ctx, svc.PreDeploy.Timeout.D())
+	defer cancel()
+	w := &capWriter{w: f, left: maxOpLog}
+	err = g.Docker.RunOnce(rctx, spec, w)
+	if w.cut {
+		fmt.Fprintf(f, "\n[shiftgate: output truncated at %d bytes]\n", maxOpLog)
+	}
+	if err != nil {
+		if rctx.Err() == context.DeadlineExceeded {
+			return fmt.Errorf("pre_deploy did not finish within %s (container removed; output in %s)", svc.PreDeploy.Timeout.D(), op.OpLog)
+		}
+		return fmt.Errorf("pre_deploy: %v (output in %s)", err, op.OpLog)
+	}
+	return nil
+}
+
+// capWriter writes at most left bytes and drops the rest.
+type capWriter struct {
+	w    io.Writer
+	left int
+	cut  bool
+}
+
+func (c *capWriter) Write(p []byte) (int, error) {
+	n := len(p)
+	if len(p) > c.left {
+		p, c.cut = p[:c.left], true
+	}
+	if len(p) > 0 {
+		if _, err := c.w.Write(p); err != nil {
+			return 0, err
+		}
+		c.left -= len(p)
+	}
+	return n, nil
 }

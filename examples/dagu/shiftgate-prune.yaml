@@ -1,0 +1,10 @@
+# Dagu DAG (example): remove old images once a day, keeping keep_digests
+# per service plus everything a colour container or the state still uses.
+schedule: "17 4 * * *"
+max_active_runs: 1
+steps:
+  - name: prune
+    run: shiftgate prune
+    continue_on:
+      exit_code: [75]
+      mark_success: true

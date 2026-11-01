@@ -4,6 +4,7 @@
 package state
 
 import (
+	"bytes"
 	"crypto/rand"
 	"encoding/hex"
 	"encoding/json"
@@ -12,6 +13,7 @@ import (
 	"io/fs"
 	"os"
 	"path/filepath"
+	"slices"
 	"syscall"
 	"time"
 
@@ -50,6 +52,19 @@ type Intent struct {
 	From      *Slot     `json:"from,omitempty"`
 	To        Slot      `json:"to"`
 	StartedAt time.Time `json:"started_at"`
+	// OpLog is the file holding captured pre_deploy output, if any.
+	OpLog string `json:"op_log,omitempty"`
+}
+
+// Hold stops `follow` from deploying one digest again: the digest a
+// rollback moved away from, or one whose followed deploy failed. It lasts
+// until the followed tag resolves to a different digest, or the held digest
+// is deployed explicitly.
+type Hold struct {
+	Digest string    `json:"digest"`
+	Reason string    `json:"reason"` // rolled_back | deploy_failed:<result>
+	OpID   string    `json:"op_id"`
+	At     time.Time `json:"at"`
 }
 
 // State is state.json. Active/Previous are committed truth; Pending is the
@@ -66,6 +81,7 @@ type State struct {
 	LastOp            string    `json:"last_op,omitempty"`
 	LastResult        string    `json:"last_result,omitempty"`
 	LastError         string    `json:"last_error,omitempty"`
+	Hold              *Hold     `json:"hold,omitempty"`
 	Pending           *Intent   `json:"pending,omitempty"`
 }
 
@@ -178,6 +194,7 @@ type SwapRecord struct {
 	Result     string       `json:"result"`
 	Error      string       `json:"error,omitempty"`
 	Warnings   []string     `json:"warnings,omitempty"`
+	OpLog      string       `json:"op_log,omitempty"`
 }
 
 // AppendSwap appends one JSON line to svc's swap log (audit, not authority).
@@ -203,6 +220,74 @@ func (st Store) AppendSwap(r SwapRecord) error {
 		return err
 	}
 	return f.Close()
+}
+
+// LastSwap returns the newest swaps.log record of svc, or nil when the log
+// is absent or empty. Only the file's tail is read.
+func (st Store) LastSwap(svc string) (*SwapRecord, error) {
+	f, err := os.Open(st.LogPath(svc))
+	if errors.Is(err, fs.ErrNotExist) {
+		return nil, nil
+	}
+	if err != nil {
+		return nil, err
+	}
+	defer f.Close()
+	fi, err := f.Stat()
+	if err != nil {
+		return nil, err
+	}
+	const tail = 64 << 10
+	off := max(fi.Size()-tail, 0)
+	buf := make([]byte, fi.Size()-off)
+	if _, err := f.ReadAt(buf, off); err != nil {
+		return nil, err
+	}
+	lines := bytes.Split(bytes.TrimRight(buf, "\n"), []byte("\n"))
+	last := lines[len(lines)-1]
+	if len(last) == 0 {
+		return nil, nil
+	}
+	var r SwapRecord
+	if err := json.Unmarshal(last, &r); err != nil {
+		return nil, fmt.Errorf("%s: last line: %w", st.LogPath(svc), err)
+	}
+	return &r, nil
+}
+
+// opLogsKept bounds the pre_deploy output files kept per service.
+const opLogsKept = 20
+
+// CreateOpLog creates <svc>/ops/<opID>.log (mode 0600) for captured command
+// output and removes all but the newest opLogsKept files.
+func (st Store) CreateOpLog(svc, opID string) (*os.File, error) {
+	dir := filepath.Join(st.serviceDir(svc), "ops")
+	if err := os.MkdirAll(dir, 0o700); err != nil {
+		return nil, err
+	}
+	f, err := os.OpenFile(filepath.Join(dir, opID+".log"), os.O_WRONLY|os.O_CREATE|os.O_TRUNC, 0o600)
+	if err != nil {
+		return nil, err
+	}
+	if ents, err := os.ReadDir(dir); err == nil && len(ents) > opLogsKept {
+		type ent struct {
+			name string
+			mod  time.Time
+		}
+		var all []ent
+		for _, e := range ents {
+			if info, err := e.Info(); err == nil && !e.IsDir() {
+				all = append(all, ent{e.Name(), info.ModTime()})
+			}
+		}
+		slices.SortFunc(all, func(a, b ent) int { return b.mod.Compare(a.mod) })
+		for _, e := range all[min(opLogsKept, len(all)):] {
+			if e.name != opID+".log" {
+				_ = os.Remove(filepath.Join(dir, e.name))
+			}
+		}
+	}
+	return f, nil
 }
 
 // ErrLocked means another shiftgate process holds the lock.

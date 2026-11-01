@@ -56,8 +56,30 @@ func (d Duration) D() time.Duration { return time.Duration(d) }
 type File struct {
 	StateDir    string     `yaml:"state_dir"`
 	KeepDigests int        `yaml:"keep_digests"`
+	Log         LogOptions `yaml:"log"`
 	HAProxy     HAProxy    `yaml:"haproxy"`
 	Services    []*Service `yaml:"services"`
+}
+
+// LogOptions bounds the json-file logs of every container shiftgate runs.
+// A service's own log block overrides the top-level one field by field.
+type LogOptions struct {
+	MaxSize string `yaml:"max_size"` // docker size: 10m, 512k, 1g
+	MaxFile int    `yaml:"max_file"` // rotated files kept
+}
+
+// Default log limits (documented in README).
+const (
+	DefaultLogMaxSize = "10m"
+	DefaultLogMaxFile = 3
+)
+
+// PreDeploy is a one-shot command run with the new image before the new
+// colour starts (for example database migrations).
+type PreDeploy struct {
+	// Args replace the image's CMD; its ENTRYPOINT is kept.
+	Args    []string `yaml:"args"`
+	Timeout Duration `yaml:"timeout"`
 }
 
 // HAProxy describes the one shared HAProxy instance on this host.
@@ -115,6 +137,12 @@ type Service struct {
 	Args          []string          `yaml:"args"`
 	DrainTimeout  Duration          `yaml:"drain_timeout"`
 	StopTimeout   Duration          `yaml:"stop_timeout"`
+	Log           LogOptions        `yaml:"log"`
+	PreDeploy     *PreDeploy        `yaml:"pre_deploy"`
+	// RegistryAuthFile is an env-style file with REGISTRY_USERNAME and
+	// REGISTRY_PASSWORD that `follow` reads to resolve tags of a private
+	// image. Unset means anonymous access.
+	RegistryAuthFile string `yaml:"registry_auth_file"`
 }
 
 // Ports holds the host port of each colour.
@@ -152,6 +180,9 @@ func (s *Service) Port(c Color) int {
 
 // ContainerName is the Docker name of colour c.
 func (s *Service) ContainerName(c Color) string { return "shiftgate-" + s.Name + "-" + string(c) }
+
+// PreDeployName is the Docker name of the one-shot pre_deploy container.
+func (s *Service) PreDeployName() string { return "shiftgate-" + s.Name + "-pre-deploy" }
 
 // Service returns the named service.
 func (f *File) Service(name string) (*Service, error) {
@@ -198,6 +229,12 @@ func (f *File) defaults() {
 	}
 	if f.KeepDigests == 0 {
 		f.KeepDigests = 3
+	}
+	if f.Log.MaxSize == "" {
+		f.Log.MaxSize = DefaultLogMaxSize
+	}
+	if f.Log.MaxFile == 0 {
+		f.Log.MaxFile = DefaultLogMaxFile
 	}
 	h := &f.HAProxy
 	if h.Config == "" {
@@ -251,6 +288,15 @@ func (f *File) defaults() {
 		}
 		def(&s.DrainTimeout, 30*time.Second)
 		def(&s.StopTimeout, 10*time.Second)
+		if s.Log.MaxSize == "" {
+			s.Log.MaxSize = f.Log.MaxSize
+		}
+		if s.Log.MaxFile == 0 {
+			s.Log.MaxFile = f.Log.MaxFile
+		}
+		if s.PreDeploy != nil {
+			def(&s.PreDeploy.Timeout, 10*time.Minute)
+		}
 		if !s.Static() && s.ContainerPort == 0 && s.Network != "host" {
 			s.ContainerPort = 8080
 		}
@@ -265,6 +311,7 @@ var (
 	envKeyRE  = regexp.MustCompile(`^[A-Za-z_][A-Za-z0-9_]*$`)
 	imageRE   = regexp.MustCompile(`^[a-z0-9]+([._-][a-z0-9]+)*(:[0-9]+)?(/[a-z0-9]+([._-][a-z0-9]+)*)*$`)
 	pathRE    = regexp.MustCompile(`^/[A-Za-z0-9._~!$&'()*+,;=:@%/-]*$`)
+	logSizeRE = regexp.MustCompile(`^[1-9][0-9]{0,5}[kmg]?$`)
 	errConfig = errors.New("invalid configuration")
 )
 
@@ -274,7 +321,7 @@ var managedRunFlags = []string{
 	"--name", "--label", "-l", "--network", "--net", "-p", "--publish", "-P", "--publish-all",
 	"--env-file", "-e", "--env", "--rm", "-d", "--detach", "--restart", "-i", "-t",
 	"--interactive", "--tty", "--privileged", "--pid", "--ipc", "--userns", "--uts", "--cap-add",
-	"--security-opt", "--device", "--entrypoint",
+	"--security-opt", "--device", "--entrypoint", "--log-driver", "--log-opt",
 }
 
 // MaxKeepDigests is the promotion history length kept in state.json.
@@ -289,6 +336,15 @@ func (f *File) validate() error {
 	if f.KeepDigests < 1 || f.KeepDigests > MaxKeepDigests {
 		bad("keep_digests must be 1-%d (the promotion history holds %d entries)", MaxKeepDigests, MaxKeepDigests)
 	}
+	validLog := func(where string, l LogOptions) {
+		if !logSizeRE.MatchString(l.MaxSize) {
+			bad("%slog.max_size must be a docker size such as 10m, 512k or 1g (got %q)", where, l.MaxSize)
+		}
+		if l.MaxFile < 1 || l.MaxFile > 100 {
+			bad("%slog.max_file must be 1-100", where)
+		}
+	}
+	validLog("", f.Log)
 	t := f.HAProxy.Timeouts
 	for name, d := range map[string]Duration{"connect": t.Connect, "client": t.Client, "server": t.Server,
 		"tunnel": t.Tunnel, "http_request": t.HTTPRequest} {
@@ -392,7 +448,22 @@ func (f *File) validate() error {
 			if s.Image != "" || s.Ports != (Ports{}) {
 				bad("%s: a static upstream cannot also set image or ports", where)
 			}
+			if s.PreDeploy != nil || s.RegistryAuthFile != "" {
+				bad("%s: a static upstream cannot set pre_deploy or registry_auth_file", where)
+			}
 			continue
+		}
+		validLog(where+": ", s.Log)
+		if p := s.PreDeploy; p != nil {
+			if len(p.Args) == 0 {
+				bad("%s: pre_deploy.args must name the command to run", where)
+			}
+			if p.Timeout.D() <= 0 {
+				bad("%s: pre_deploy.timeout must be positive", where)
+			}
+		}
+		if s.RegistryAuthFile != "" && !strings.HasPrefix(s.RegistryAuthFile, "/") {
+			bad("%s: registry_auth_file must be an absolute path", where)
 		}
 		if !imageRE.MatchString(s.Image) {
 			bad("%s: image must be a repository without tag or digest (got %q)", where, s.Image)
