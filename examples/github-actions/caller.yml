@@ -12,6 +12,7 @@ jobs:
     uses: ./.github/workflows/shiftgate-deploy.yml
     with:
       service: web
+      image: ghcr.io/example/web   # = image of "web" in the host's services.yaml
       host: app-host-1        # tailnet (MagicDNS) name of the target host
     secrets:
       TS_OAUTH_CLIENT_ID: ${{ secrets.TS_OAUTH_CLIENT_ID }}

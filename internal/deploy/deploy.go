@@ -292,6 +292,9 @@ func (g *Gate) Deploy(ctx context.Context, name, digest string) (*Result, error)
 		g.logf("%s: %s is unhealthy; HAProxy untouched, stopping it", name, target)
 		return nil, g.abort(ss, "unhealthy", err, true)
 	}
+	if err := g.verifyTarget(ctx, svc, op.To); err != nil {
+		return nil, g.abort(ss, "target_not_running", err, true)
+	}
 	return g.flipAndCommit(ctx, ss)
 }
 
@@ -338,7 +341,28 @@ func (g *Gate) Rollback(ctx context.Context, name string) (*Result, error) {
 	if err := health.Wait(ctx, g.Health, svc.Health, svc.Port(prev.Color)); err != nil {
 		return nil, g.abort(ss, "unhealthy", err, true)
 	}
+	if err := g.verifyTarget(ctx, svc, prev); err != nil {
+		return nil, g.abort(ss, "target_not_running", err, true)
+	}
 	return g.flipAndCommit(ctx, ss)
+}
+
+// verifyTarget re-inspects the target after the health check: the probe
+// only proves that something answers on the colour port (with host
+// networking that could be another process), so the container itself must
+// still be running, owned by this service and colour, and at the digest.
+func (g *Gate) verifyTarget(ctx context.Context, svc *config.Service, to state.Slot) error {
+	name := svc.ContainerName(to.Color)
+	c, ok, err := g.Docker.Inspect(ctx, name)
+	switch {
+	case err != nil:
+		return fmt.Errorf("inspect %s: %w", name, err)
+	case !ok || !c.Running:
+		return fmt.Errorf("container %s is not running after the health check (something else may answer on port %d)", name, svc.Port(to.Color))
+	case !owned(c, svc, to.Color) || c.Labels[docker.LabelDigest] != to.Digest:
+		return fmt.Errorf("container %s does not carry %s/%s@%s", name, svc.Name, to.Color, short(to.Digest))
+	}
+	return nil
 }
 
 // abort ends an operation that never changed routing: the target container
@@ -524,7 +548,15 @@ func (g *Gate) syncConfig(ctx context.Context) error {
 	if err != nil {
 		return err
 	}
-	data, err := haproxy.Render(g.Cfg, enabled, false)
+	// A wildcard bind allowed only by an explicit `render --allow-wildcard-bind`
+	// stays allowed here when the installed file already carries exactly
+	// that bind line: the operator approved it, and refusing would leave the
+	// file naming the old colour as active.
+	allow, err := haproxy.WildcardsApproved(g.Cfg)
+	if err != nil {
+		return err
+	}
+	data, err := haproxy.Render(g.Cfg, enabled, allow)
 	if err != nil {
 		return err
 	}
@@ -544,7 +576,9 @@ func (g *Gate) Recover(ctx context.Context, name string) (string, error) {
 	}
 	if op.Phase == state.PhaseStarting {
 		// Routing was never touched: stop the half-started target.
-		_ = g.abort(ss, "recovered_abort", errors.New("interrupted before the flip"), true)
+		if err := g.abort(ss, "recovered_abort", errors.New("interrupted before the flip"), true); ExitCode(err) == CodeRecovery {
+			return "", err
+		}
 		return fmt.Sprintf("aborted %s %s before the flip; %s keeps serving", op.Op, op.OpID, slotColor(op.From)), nil
 	}
 	st, err := g.Router.Servers(ctx, svc.Backend)

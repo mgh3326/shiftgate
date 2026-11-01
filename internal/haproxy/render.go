@@ -107,8 +107,44 @@ func hd(d config.Duration) string {
 	case v%time.Second == 0:
 		return fmt.Sprintf("%ds", v/time.Second)
 	default:
-		return fmt.Sprintf("%dms", v/time.Millisecond)
+		// Round up so a non-zero sub-millisecond value never renders as 0ms.
+		return fmt.Sprintf("%dms", (v+time.Millisecond-1)/time.Millisecond)
 	}
+}
+
+// WildcardsApproved reports whether every wildcard bind in f already
+// appears as a bind line of the installed config, i.e. an earlier explicit
+// render approved it. With no wildcard binds it reports false (nothing to
+// approve); a missing file approves nothing.
+func WildcardsApproved(f *config.File) (bool, error) {
+	var wild []string
+	for _, s := range f.Services {
+		for _, b := range s.Binds {
+			if ip, err := config.BindAddr(b); err == nil && ip.IsUnspecified() {
+				wild = append(wild, b)
+			}
+		}
+	}
+	if len(wild) == 0 {
+		return false, nil
+	}
+	cur, err := os.ReadFile(f.HAProxy.Config)
+	if errors.Is(err, os.ErrNotExist) {
+		return false, nil
+	}
+	if err != nil {
+		return false, err
+	}
+	lines := map[string]bool{}
+	for _, l := range strings.Split(string(cur), "\n") {
+		lines[strings.TrimSpace(l)] = true
+	}
+	for _, b := range wild {
+		if !lines["bind "+b] {
+			return false, nil
+		}
+	}
+	return true, nil
 }
 
 // Enabled reads every blue-green service's committed active colour. It
@@ -183,6 +219,17 @@ func Install(ctx context.Context, f *config.File, data []byte) error {
 	if err := state.WriteFileAtomic(path+".previous", cur, 0o644); err != nil {
 		return err
 	}
+	if err := overwrite(path, data); err != nil {
+		if rerr := overwrite(path, cur); rerr != nil {
+			return fmt.Errorf("%w; restoring the previous config also failed (copy %s.previous back): %v", err, path, rerr)
+		}
+		return err
+	}
+	return nil
+}
+
+// overwrite replaces path's content in place (same inode) and syncs it.
+func overwrite(path string, data []byte) error {
 	out, err := os.OpenFile(path, os.O_WRONLY|os.O_TRUNC, 0)
 	if err != nil {
 		return err

@@ -21,8 +21,8 @@ import (
 // SchemaVersion is written into every state file.
 const SchemaVersion = 1
 
-// historyCap bounds the digest history kept for prune.
-const historyCap = 50
+// historyCap bounds the digest history kept for prune (= config.MaxKeepDigests).
+const historyCap = config.MaxKeepDigests
 
 // Slot is one colour's deployed identity.
 type Slot struct {

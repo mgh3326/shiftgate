@@ -36,7 +36,12 @@ Host setup, once:
 2. Let shiftgate own the HAProxy configuration file named in
    `haproxy.config`. The generated file declares the admin socket
    (`stats socket … level admin`) that shiftgate uses for flips.
-3. Run `sudo shiftgate render`. It generates the file, validates it with
+3. If the images are private, log the host in to the registry once as the
+   user that runs shiftgate (for GHCR: `docker login ghcr.io` with a token
+   that has only `read:packages`). shiftgate pulls `image@digest` with
+   Docker's stored credentials. Without them, a deploy aborts with
+   `pull_failed` and the old colour keeps serving.
+4. Run `sudo shiftgate render`. It generates the file, validates it with
    `haproxy -c`, installs it and reloads HAProxy. Every colour starts
    disabled until its first deploy.
 
@@ -194,18 +199,25 @@ Say `web` runs today as `web.service` (`ExecStart=/opt/web/web
    (`127.0.0.1:8080`). Choose two free colour ports (`18080`, `18081`).
    They must not equal the bind port on loopback, so the old binary and the
    new colours can coexist during cut-over.
-4. **Render without traffic.** Add the service to `services.yaml` and run
-   `shiftgate render`. If the old binary still owns `127.0.0.1:8080`, first
-   bind the HAProxy frontend to a temporary port, or stop the unit in step 5
-   before rendering.
-5. **First deploy.** `shiftgate deploy web --digest sha256:…` starts blue,
-   health-checks it, and enables it in HAProxy. Then stop and disable the
-   old unit (`systemctl disable --now web.service`). If the frontend used a
-   temporary port, change `binds` to the real one and `render` again.
+4. **Keep the routes you already have, then render.** `render` replaces
+   the whole HAProxy file with what `services.yaml` declares, so first
+   declare every route HAProxy must keep serving. For example, the frontend
+   that forwards traffic to the old binary today becomes a static service:
+   `{name: web-legacy, binds: ["127.0.0.1:8080"], upstream: "127.0.0.1:8081", health: {http: /healthz}}`.
+   Add `web` itself on a temporary bind (for example `127.0.0.1:8090`),
+   check the result with `shiftgate render --dry-run`, and then run
+   `shiftgate render`. Until you are sure, you can also leave your
+   hand-written config in place and point `haproxy.config` at a separate
+   file.
+5. **First deploy, then cut over.** `shiftgate deploy web --digest sha256:…`
+   starts blue, health-checks it, and enables it in HAProxy on the temporary
+   bind. Check it there. Then remove `web-legacy`, move `web`'s bind to the
+   real address (`127.0.0.1:8080`), run `shiftgate render`, and stop the old
+   unit (`systemctl disable --now web.service`).
 6. **Rollback during migration.** Until a second shiftgate deploy exists,
    `shiftgate rollback` has nothing to go back to. To go back, re-enable
-   `web.service` and remove the service from `services.yaml` (then
-   `render`).
+   `web.service`, restore the `web-legacy` static route on the real bind,
+   and run `render`.
 7. **Clean up.** After a few deploys, `shiftgate prune web` removes old
    images. Delete the old binary and unit when you no longer need them.
 

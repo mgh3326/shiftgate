@@ -30,6 +30,8 @@ type fakeDocker struct {
 	pullEnter  chan struct{} // signalled when Pull starts
 	failRemove map[string]bool
 	pullErr    error
+	// exitAfterRun makes a new container stop right after it starts.
+	exitAfterRun bool
 }
 
 type fakeCtr struct {
@@ -80,7 +82,7 @@ func (d *fakeDocker) Run(ctx context.Context, spec docker.RunSpec) error {
 	} else {
 		hostPort, _ = strconv.Atoi(spec.Env["PORT"])
 	}
-	d.containers[spec.Name] = &fakeCtr{labels: spec.Labels, running: true, port: hostPort}
+	d.containers[spec.Name] = &fakeCtr{labels: spec.Labels, running: !d.exitAfterRun, port: hostPort}
 	return nil
 }
 
@@ -169,6 +171,8 @@ type fakeHealth struct {
 	d   *fakeDocker
 	mu  sync.Mutex
 	bad map[string]bool
+	// foreign marks ports where some other process answers the probe.
+	foreign map[int]bool
 }
 
 func (h *fakeHealth) markBad(digest string) {
@@ -184,6 +188,9 @@ func (h *fakeHealth) Probe(ctx context.Context, _ config.Health, addr string) er
 	defer h.d.mu.Unlock()
 	h.mu.Lock()
 	defer h.mu.Unlock()
+	if h.foreign[port] {
+		return nil
+	}
 	for _, c := range h.d.containers {
 		if c.port == port && c.running {
 			if h.bad[c.labels[docker.LabelDigest]] {
@@ -235,7 +242,7 @@ func newHarness(t *testing.T) *harness {
 		t.Fatal(err)
 	}
 	d := newFakeDocker()
-	h := &fakeHealth{d: d, bad: map[string]bool{}}
+	h := &fakeHealth{d: d, bad: map[string]bool{}, foreign: map[int]bool{}}
 	g := &deploy.Gate{
 		Cfg:         cfg,
 		Store:       state.Store{Dir: cfg.StateDir},

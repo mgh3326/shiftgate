@@ -27,6 +27,11 @@ on:
         required: false
         type: string
         default: deploy
+      image:
+        description: image repository; must equal the service's `image` in the host's services.yaml (default ghcr.io/<owner>/<repo>)
+        required: false
+        type: string
+        default: ''
       context:
         description: docker build context
         required: false
@@ -83,7 +88,12 @@ jobs:
 
       - name: Image name
         id: image
-        run: echo "name=ghcr.io/${GITHUB_REPOSITORY,,}" >> "$GITHUB_OUTPUT"
+        env:
+          IMAGE: ${{ inputs.image }}
+        run: |
+          name=${IMAGE:-ghcr.io/${GITHUB_REPOSITORY,,}}
+          [[ "$name" =~ ^ghcr\.io/[a-z0-9._/-]+$ ]] || { echo "image must be a lowercase ghcr.io repository"; exit 1; }
+          echo "name=$name" >> "$GITHUB_OUTPUT"
 
       - name: Build and push
         id: build

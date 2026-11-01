@@ -8,6 +8,7 @@ import (
 	"path/filepath"
 	"strings"
 	"testing"
+	"time"
 
 	"github.com/mgh3326/shiftgate/internal/config"
 	"github.com/mgh3326/shiftgate/internal/haproxy"
@@ -56,6 +57,21 @@ func TestRenderEnablesOnlyActiveColour(t *testing.T) {
 	} {
 		if !strings.Contains(s, want) {
 			t.Fatalf("render lacks %q:\n%s", want, s)
+		}
+	}
+}
+
+func TestRenderNeverRoundsDurationToZero(t *testing.T) {
+	f := load(t, "../../examples/services.yaml")
+	f.HAProxy.Timeouts.Connect = config.Duration(500 * time.Microsecond)
+	f.HAProxy.Timeouts.Client = config.Duration(1500 * time.Millisecond)
+	out, err := haproxy.Render(f, nil, false)
+	if err != nil {
+		t.Fatal(err)
+	}
+	for _, want := range []string{"timeout connect 1ms\n", "timeout client 1500ms\n"} {
+		if !strings.Contains(string(out), want) {
+			t.Fatalf("render lacks %q", want)
 		}
 	}
 }

@@ -189,6 +189,58 @@ func TestPullFailureKeepsRollback(t *testing.T) {
 	}
 }
 
+// The health probe only proves that something answers on the colour port.
+// With the new container gone, a foreign listener must never get traffic.
+func TestTargetMustBeRunningBeforeFlip(t *testing.T) {
+	h := newHarness(t)
+	h.mustDeploy(1)
+	before := setCommands(h.fake.Commands())
+	h.docker.exitAfterRun = true
+	h.health.foreign[18081] = true // green's port answers, but not from green
+	_, err := h.gate.Deploy(context.Background(), "web", digest(2))
+	if deploy.ExitCode(err) != deploy.CodeFailed || !strings.Contains(err.Error(), "not running") {
+		t.Fatalf("want refusal before the flip, got %v", err)
+	}
+	if after := setCommands(h.fake.Commands()); !slices.Equal(before, after) {
+		t.Fatalf("HAProxy changed: %v", after[len(before):])
+	}
+	if st := h.state(); st.Active.Digest != digest(1) || st.LastResult != "target_not_running" {
+		t.Fatalf("state: %+v", st)
+	}
+}
+
+// A wildcard bind approved by an explicit `render --allow-wildcard-bind`
+// must not make the post-commit config refresh fail (the file would keep
+// naming the old colour active for the next outside reload).
+func TestSyncKeepsExplicitlyApprovedWildcard(t *testing.T) {
+	h := newHarness(t)
+	h.cfg.Services[0].Binds = []string{"0.0.0.0:8080"}
+	if _, err := h.gate.Render(context.Background(), deploy.RenderOptions{NoReload: true, AllowWildcard: true}); err != nil {
+		t.Fatal(err)
+	}
+	h.mustDeploy(1)
+	res, err := h.gate.Deploy(context.Background(), "web", digest(2))
+	if err != nil {
+		t.Fatal(err)
+	}
+	if len(res.Warnings) != 0 {
+		t.Fatalf("sync should succeed for an approved wildcard: %v", res.Warnings)
+	}
+	b, _ := os.ReadFile(h.cfg.HAProxy.Config)
+	if !strings.Contains(string(b), "server green 127.0.0.1:18081 check\n") {
+		t.Fatalf("config not refreshed:\n%s", b)
+	}
+	// A wildcard that no explicit render approved is still refused.
+	h.cfg.Services[0].Binds = []string{"0.0.0.0:9090"}
+	res, err = h.gate.Deploy(context.Background(), "web", digest(3))
+	if err != nil {
+		t.Fatal(err)
+	}
+	if len(res.Warnings) == 0 || !strings.Contains(strings.Join(res.Warnings, " "), "wildcard") {
+		t.Fatalf("unapproved wildcard must not be written: %v", res.Warnings)
+	}
+}
+
 // Acceptance 4.
 func TestConcurrentDeploySecondRefusedByLock(t *testing.T) {
 	h := newHarness(t)

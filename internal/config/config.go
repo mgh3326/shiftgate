@@ -180,6 +180,11 @@ func Parse(b []byte) (*File, error) {
 	if err := dec.Decode(&f); err != nil {
 		return nil, fmt.Errorf("services.yaml: %w", err)
 	}
+	for i, s := range f.Services {
+		if s == nil {
+			return nil, fmt.Errorf("services.yaml: services[%d] is empty", i)
+		}
+	}
 	f.defaults()
 	if err := f.validate(); err != nil {
 		return nil, fmt.Errorf("services.yaml: %w", err)
@@ -272,14 +277,24 @@ var managedRunFlags = []string{
 	"--security-opt", "--device", "--entrypoint",
 }
 
+// MaxKeepDigests is the promotion history length kept in state.json.
+const MaxKeepDigests = 50
+
 func (f *File) validate() error {
 	var errs []error
 	bad := func(format string, a ...any) { errs = append(errs, fmt.Errorf(format, a...)) }
 	if !strings.HasPrefix(f.StateDir, "/") {
 		bad("state_dir must be absolute")
 	}
-	if f.KeepDigests < 1 {
-		bad("keep_digests must be at least 1")
+	if f.KeepDigests < 1 || f.KeepDigests > MaxKeepDigests {
+		bad("keep_digests must be 1-%d (the promotion history holds %d entries)", MaxKeepDigests, MaxKeepDigests)
+	}
+	t := f.HAProxy.Timeouts
+	for name, d := range map[string]Duration{"connect": t.Connect, "client": t.Client, "server": t.Server,
+		"tunnel": t.Tunnel, "http_request": t.HTTPRequest} {
+		if d < 0 {
+			bad("haproxy.timeouts.%s must not be negative", name)
+		}
 	}
 	h := f.HAProxy
 	for _, p := range []string{h.Config, h.Socket} {
@@ -422,8 +437,8 @@ func (f *File) validate() error {
 				bad("%s: run_args may not set %s (shiftgate manages it)", where, flag)
 			}
 		}
-		if s.DrainTimeout.D() < 0 || s.StopTimeout.D() < 0 {
-			bad("%s: timeouts must not be negative", where)
+		if s.DrainTimeout.D() < 0 || s.StopTimeout.D() < 0 || s.Check.Inter.D() < time.Millisecond {
+			bad("%s: timeouts must not be negative and check.inter must be at least 1ms", where)
 		}
 	}
 	for b, svc := range binds {

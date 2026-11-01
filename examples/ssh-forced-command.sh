@@ -21,4 +21,5 @@ digest=$5
 case "$digest" in sha256:*) ;; *) echo "refused: digest" >&2; exit 64 ;; esac
 hex=${digest#sha256:}
 if [ "${#hex}" -ne 64 ]; then echo "refused: digest" >&2; exit 64; fi
+case "$hex" in *[!0-9a-f]*) echo "refused: digest" >&2; exit 64 ;; esac
 exec /usr/local/bin/shiftgate deploy "$3" --digest "$digest"
