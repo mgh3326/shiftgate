@@ -64,9 +64,19 @@ type File struct {
 // LogOptions bounds the json-file logs of every container shiftgate runs.
 // A service's own log block overrides the top-level one field by field.
 type LogOptions struct {
+	// Driver is json-file (default: shiftgate pins the driver and its
+	// limits) or daemon (shiftgate sets no log flags; the Docker daemon's
+	// default applies and run_args may set --log-driver/--log-opt).
+	Driver  string `yaml:"driver"`
 	MaxSize string `yaml:"max_size"` // docker size: 10m, 512k, 1g
 	MaxFile int    `yaml:"max_file"` // rotated files kept
 }
+
+// Log drivers.
+const (
+	LogJSONFile = "json-file"
+	LogDaemon   = "daemon"
+)
 
 // Default log limits (documented in README).
 const (
@@ -230,6 +240,9 @@ func (f *File) defaults() {
 	if f.KeepDigests == 0 {
 		f.KeepDigests = 3
 	}
+	if f.Log.Driver == "" {
+		f.Log.Driver = LogJSONFile
+	}
 	if f.Log.MaxSize == "" {
 		f.Log.MaxSize = DefaultLogMaxSize
 	}
@@ -288,6 +301,12 @@ func (f *File) defaults() {
 		}
 		def(&s.DrainTimeout, 30*time.Second)
 		def(&s.StopTimeout, 10*time.Second)
+		if s.Static() {
+			continue // no containers: log limits do not apply (validate rejects a log block)
+		}
+		if s.Log.Driver == "" {
+			s.Log.Driver = f.Log.Driver
+		}
 		if s.Log.MaxSize == "" {
 			s.Log.MaxSize = f.Log.MaxSize
 		}
@@ -337,6 +356,9 @@ func (f *File) validate() error {
 		bad("keep_digests must be 1-%d (the promotion history holds %d entries)", MaxKeepDigests, MaxKeepDigests)
 	}
 	validLog := func(where string, l LogOptions) {
+		if l.Driver != LogJSONFile && l.Driver != LogDaemon {
+			bad("%slog.driver must be json-file or daemon (got %q)", where, l.Driver)
+		}
 		if !logSizeRE.MatchString(l.MaxSize) {
 			bad("%slog.max_size must be a docker size such as 10m, 512k or 1g (got %q)", where, l.MaxSize)
 		}
@@ -448,8 +470,8 @@ func (f *File) validate() error {
 			if s.Image != "" || s.Ports != (Ports{}) {
 				bad("%s: a static upstream cannot also set image or ports", where)
 			}
-			if s.PreDeploy != nil || s.RegistryAuthFile != "" {
-				bad("%s: a static upstream cannot set pre_deploy or registry_auth_file", where)
+			if s.PreDeploy != nil || s.RegistryAuthFile != "" || s.Log != (LogOptions{}) {
+				bad("%s: a static upstream cannot set pre_deploy, registry_auth_file or log (it runs no container)", where)
 			}
 			continue
 		}
@@ -504,7 +526,7 @@ func (f *File) validate() error {
 			}
 		}
 		for _, a := range s.RunArgs {
-			if flag := managedFlag(a); flag != "" {
+			if flag := managedFlag(a); flag != "" && !(s.Log.Driver == LogDaemon && strings.HasPrefix(flag, "--log-")) {
 				bad("%s: run_args may not set %s (shiftgate manages it)", where, flag)
 			}
 		}

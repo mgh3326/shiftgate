@@ -340,6 +340,12 @@ services:
 		[]string{"--log-driver json-file", "--log-opt max-size=10m", "--log-opt max-file=3"}) {
 		t.Fatalf("default log args: %v", got)
 	}
+	// driver: daemon renders no log flags at all.
+	web.Log.Driver = config.LogDaemon
+	if got := pairs(deploy.RunSpec(web, config.Blue, digest(1)).ArgList()); len(got) != 0 {
+		t.Fatalf("daemon driver must not pin log flags: %v", got)
+	}
+	web.Log.Driver = config.LogJSONFile
 	// pre_deploy is one-shot: removed on exit, no restart policy, no publish.
 	pd := deploy.PreDeploySpec(web, config.Blue, digest(1)).ArgList()
 	if !slices.Contains(pd, "--rm") || slices.Contains(pd, "--restart") || slices.Contains(pd, "-d") || slices.Contains(pd, "-p") {
@@ -576,5 +582,111 @@ func TestStatusReportsColoursAndLastOp(t *testing.T) {
 	}
 	if st.LastOp == nil || st.LastOp.Op != "deploy" || st.LastOp.Result != "ok" || st.LastOp.ToDigest != digest(2) {
 		t.Fatalf("last op: %+v", st.LastOp)
+	}
+}
+
+// Review fix: a host-side failure (pre_deploy could not even start, or the
+// run was interrupted) must not hold a good digest.
+func TestFollowDoesNotHoldHostFailures(t *testing.T) {
+	h := newHarness(t)
+	reg := withRegistry(t, h)
+	svc, _ := h.cfg.Service("web")
+	svc.PreDeploy = &config.PreDeploy{Args: []string{"migrate"}, Timeout: config.Duration(1e9)}
+	reg.push("main", digest(1))
+	if _, err := follow(t, h); err != nil {
+		t.Fatal(err)
+	}
+	reg.push("main", digest(2))
+	// A pre_deploy container left running by a killed earlier run.
+	h.docker.containers["shiftgate-web-pre-deploy"] = &fakeCtr{running: true,
+		labels: map[string]string{"shiftgate.service": "web", "shiftgate.role": "pre_deploy"}}
+	if _, err := follow(t, h); deploy.ExitCode(err) != deploy.CodeFailed || !strings.Contains(err.Error(), "pre_deploy_refused") {
+		t.Fatalf("leftover pre_deploy container: %v", err)
+	}
+	if st := h.state(); st.Hold != nil {
+		t.Fatalf("a refused pre_deploy must not hold: %+v", st.Hold)
+	}
+	delete(h.docker.containers, "shiftgate-web-pre-deploy")
+	// An interrupted run (SIGTERM) that aborts as unhealthy is not held either.
+	ctx, cancel := context.WithCancel(context.Background())
+	h.docker.pullEnter, h.docker.pullGate = make(chan struct{}, 1), make(chan struct{})
+	go func() { <-h.docker.pullEnter; cancel(); close(h.docker.pullGate) }()
+	h.health.markBad(digest(2)) // so the cancelled run aborts in the health wait
+	if _, err := h.gate.Follow(ctx, "web", "main"); deploy.ExitCode(err) != deploy.CodeFailed {
+		t.Fatalf("cancelled follow: %v", err)
+	}
+	if st := h.state(); st.Hold != nil {
+		t.Fatalf("an interrupted run must not hold: %+v", st.Hold)
+	}
+	h.docker.pullEnter, h.docker.pullGate = nil, nil
+	h.health.mu.Lock()
+	delete(h.health.bad, digest(2))
+	h.health.mu.Unlock()
+	if r, err := follow(t, h); err != nil || r.Action != deploy.FollowDeployed {
+		t.Fatalf("follow after the host was fixed: %+v %v", r, err)
+	}
+}
+
+// Review fix: while a deploy is before its flip (pull, pre_deploy), the old
+// colour still serves, so check keeps probing it instead of skipping.
+func TestCheckWatchesActiveDuringDeployStartingPhase(t *testing.T) {
+	h := newHarness(t)
+	h.mustDeploy(1)
+	h.docker.pullEnter, h.docker.pullGate = make(chan struct{}, 1), make(chan struct{})
+	done := make(chan error, 1)
+	go func() { _, err := h.gate.Deploy(context.Background(), "web", digest(2)); done <- err }()
+	<-h.docker.pullEnter
+	if r, err := checkOne(t, h, false); err != nil || r.Failed() || r.Skipped != "" {
+		t.Fatalf("serving colour during a deploy should be checked and pass: %+v %v", r, err)
+	}
+	h.docker.set("shiftgate-web-blue", func(c *fakeCtr) { c.running = false })
+	r, err := checkOne(t, h, true)
+	if deploy.ExitCode(err) != deploy.CodeFailed || r.Kind != deploy.KindStopped || !strings.Contains(r.Reason, "not healed") {
+		t.Fatalf("dead serving colour during a deploy must fail (unhealed, lock busy): %+v %v", r, err)
+	}
+	if got := h.docker.callsWith("restart"); len(got) != 0 {
+		t.Fatalf("no restart while the deploy holds the lock: %v", got)
+	}
+	close(h.docker.pullGate)
+	<-done
+}
+
+// Review fix (#3 thread on check.go): an intent that appears while check
+// probes is an operation in progress only if someone holds the lock; an
+// intent left by a process that died is recovery_required, not a skip.
+func TestCheckIntentWrittenDuringProbe(t *testing.T) {
+	for _, held := range []bool{false, true} {
+		h := newHarness(t)
+		h.mustDeploy(1)
+		h.docker.set("shiftgate-web-blue", func(c *fakeCtr) { c.running = false })
+		var lk *state.Lock
+		h.docker.onInspect = func(string) {
+			h.docker.onInspect = nil
+			st := h.state()
+			st.Pending = &state.Intent{OpID: "dead", Op: "deploy", Phase: state.PhaseFlipping, From: st.Active,
+				To: state.Slot{Color: config.Green, Digest: digest(2)}}
+			if err := h.store.Save(st); err != nil {
+				t.Fatal(err)
+			}
+			if held {
+				var err error
+				if lk, err = h.store.LockService("web"); err != nil {
+					t.Fatal(err)
+				}
+			}
+		}
+		r, err := checkOne(t, h, false)
+		if lk != nil { // only the held iteration takes the lock
+			lk.Unlock()
+		}
+		if held {
+			if err != nil || r.Skipped == "" {
+				t.Fatalf("live flip during the probe should skip: %+v %v", r, err)
+			}
+			continue
+		}
+		if deploy.ExitCode(err) != deploy.CodeFailed || r.Kind != deploy.KindPending {
+			t.Fatalf("stale intent written during the probe must fail as %s: %+v %v", deploy.KindPending, r, err)
+		}
 	}
 }

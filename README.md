@@ -103,8 +103,11 @@ Exit codes:
   `swaps.log` as `op: heal`. A container that is missing, not shiftgate's,
   or in HAProxy maintenance is reported, not restarted.
 - **`follow` does not undo a rollback.** `rollback` holds the digest it
-  moved away from, and a followed deploy that fails (except a pull failure)
-  holds its digest, so a bad push is not retried every minute. `follow`
+  moved away from, and a followed deploy that fails because of the image
+  (`unhealthy`, `target_not_running`, or a `pre_deploy` command that ran
+  and failed) holds its digest, so a bad push is not retried every minute.
+  Host-side failures (pull, Docker, HAProxy, a `pre_deploy` that could not
+  start, an interrupted run) are retried on the next run. `follow`
   deploys again only when the tag points at a new digest. An explicit
   `deploy` of the held digest clears the hold.
 - **Binds are allowlisted.** Every `bind` address must appear in
@@ -146,7 +149,7 @@ services:
     check: {inter: 2s, fall: 2, rise: 1}  # HAProxy's own server checks
     drain_timeout: 30s             # wait this long for sessions to finish before stopping the old colour
     stop_timeout: 10s              # docker stop grace period
-    log: {max_file: 5}             # per-service override of the top-level log block, field by field
+    log: {max_file: 5}             # per-service override of the top-level log block, field by field; driver: daemon opts out
     pre_deploy:                    # optional one-shot command before the new colour starts
       args: ["alembic", "upgrade", "head"]   # replaces the image CMD; ENTRYPOINT is kept
       timeout: 10m                 # default 10m; on timeout the container is removed and the deploy aborts
@@ -168,7 +171,11 @@ similar.
 pinned so the limits apply even when the Docker daemon's default driver is
 different. The default is 10m x 3 (at most about 30 MB per container). The
 limits apply when a container is created, so a running colour keeps its old
-settings until its next deploy.
+settings until its next deploy. To keep the Docker daemon's own logging
+(journald, Loki, …), set `log: {driver: daemon}` at the top level or per
+service: shiftgate then sets no log flags, and `run_args` may set
+`--log-driver`/`--log-opt` again. A static upstream runs no container and
+may not set `log`.
 
 **`pre_deploy`.** The command runs as `docker run --rm` with the new image
 (`image@digest`), the same `env_files`, `env` (with `{color}` and `{port}`
@@ -279,8 +286,10 @@ cluster would do continuously:
 
 Exit code 75 means another operation holds the lock; the next run retries,
 so treat it as success. Run `check` independently of `follow`: a failed
-deploy must not stop the monitor, and `check` skips a service while a
-deploy holds its lock.
+deploy must not stop the monitor. While a deploy is pulling or running
+`pre_deploy`, `check` keeps probing the colour that still serves (it reports
+but cannot heal it, because the deploy holds the lock); during a flip it
+skips the service.
 
 **Dagu.** [`examples/dagu/`](examples/dagu/) has one DAG per job
 (`shiftgate-follow-web.yaml`, `shiftgate-check.yaml`,

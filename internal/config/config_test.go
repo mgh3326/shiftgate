@@ -56,6 +56,8 @@ func TestRejects(t *testing.T) {
 		"health path injection":  {`health: {http: /healthz}`, `health: {http: "/x\nbind 0.0.0.0:1"}`, "absolute path"},
 		"log size":               {`haproxy:`, "log: {max_size: 10MB}\nhaproxy:", "log.max_size"},
 		"log files":              {`health: {http: /healthz}`, "health: {http: /healthz}\n    log: {max_file: -1}", "log.max_file"},
+		"log on static upstream": {`health: {http: /healthz}`, "health: {http: /healthz}\n  - name: legacy\n    binds: [\"127.0.0.1:9000\"]\n    upstream: 127.0.0.1:9001\n    health: {tcp: true}\n    log: {max_file: -1}", "cannot set pre_deploy, registry_auth_file or log"},
+		"bad log driver":         {`haproxy:`, "log: {driver: journald}\nhaproxy:", "log.driver"},
 		"log-opt in run_args":    {`health: {http: /healthz}`, "health: {http: /healthz}\n    run_args: [\"--log-opt=max-size=1g\"]", "may not set --log-opt"},
 		"empty pre_deploy":       {`health: {http: /healthz}`, "health: {http: /healthz}\n    pre_deploy: {timeout: 1m}", "pre_deploy.args"},
 		"relative registry auth": {`health: {http: /healthz}`, "health: {http: /healthz}\n    registry_auth_file: reg.env", "registry_auth_file"},
@@ -103,14 +105,24 @@ func TestLogAndPreDeployDefaults(t *testing.T) {
 	if err != nil {
 		t.Fatal(err)
 	}
-	if f.Log != (config.LogOptions{MaxSize: "10m", MaxFile: 3}) {
+	if f.Log != (config.LogOptions{Driver: "json-file", MaxSize: "10m", MaxFile: 3}) {
 		t.Fatalf("top-level log default: %+v", f.Log)
 	}
 	s := f.Services[0]
-	if s.Log != (config.LogOptions{MaxSize: "50m", MaxFile: 3}) {
+	if s.Log != (config.LogOptions{Driver: "json-file", MaxSize: "50m", MaxFile: 3}) {
 		t.Fatalf("service log override: %+v", s.Log)
 	}
 	if s.PreDeploy == nil || s.PreDeploy.Timeout.D().Minutes() != 10 {
 		t.Fatalf("pre_deploy default timeout: %+v", s.PreDeploy)
+	}
+}
+
+// log.driver: daemon leaves logging to the Docker daemon, so run_args may
+// set the log flags again (configs from before log limits keep loading).
+func TestLogDriverDaemonAllowsRunArgs(t *testing.T) {
+	f, err := config.Parse([]byte(strings.Replace(base, "health: {http: /healthz}",
+		"health: {http: /healthz}\n    log: {driver: daemon}\n    run_args: [\"--log-driver=journald\"]", 1)))
+	if err != nil || f.Services[0].Log.Driver != config.LogDaemon || f.Log.Driver != config.LogJSONFile {
+		t.Fatalf("%v %+v", err, f)
 	}
 }
