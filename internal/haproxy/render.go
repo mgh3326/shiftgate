@@ -216,8 +216,13 @@ func Install(ctx context.Context, f *config.File, data []byte) error {
 	case bytes.Equal(cur, data):
 		return nil
 	}
-	if err := state.WriteFileAtomic(path+".previous", cur, 0o644); err != nil {
-		return err
+	// Back up the live file only if it is itself valid: after a failed write
+	// and a failed restore it may be partial, and .previous must keep the
+	// last known-good copy.
+	if Validate(ctx, f, path) == nil {
+		if err := state.WriteFileAtomic(path+".previous", cur, 0o644); err != nil {
+			return err
+		}
 	}
 	if err := overwrite(path, data); err != nil {
 		if rerr := overwrite(path, cur); rerr != nil {

@@ -158,6 +158,21 @@ func TestInstallRejectsInvalidAndKeepsCurrent(t *testing.T) {
 	if b, _ := os.ReadFile(f.HAProxy.Config + ".previous"); string(b) != "current\n" {
 		t.Fatalf(".previous backup = %q", b)
 	}
+	// A live file that fails the check (e.g. left partial by a crash) must
+	// not replace the last known-good backup.
+	if err := os.WriteFile(f.HAProxy.Config, []byte("partial"), 0o644); err != nil {
+		t.Fatal(err)
+	}
+	f.HAProxy.Check = []string{"sh", "-c", "grep -q next \"$1\" || grep -q good \"$1\"", "check", "{config}"}
+	if err := haproxy.Install(context.Background(), f, []byte("good\n")); err != nil {
+		t.Fatal(err)
+	}
+	if b, _ := os.ReadFile(f.HAProxy.Config + ".previous"); string(b) != "current\n" {
+		t.Fatalf("invalid live file overwrote the known-good backup: %q", b)
+	}
+	if b, _ := os.ReadFile(f.HAProxy.Config); string(b) != "good\n" {
+		t.Fatalf("live config = %q", b)
+	}
 }
 
 // The adopter layout renders the same proxies, binds and checks as its
