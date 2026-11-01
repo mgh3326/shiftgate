@@ -1,0 +1,105 @@
+name: Release
+
+# A v* tag builds the four CGO-disabled release binaries (linux/darwin x
+# amd64/arm64) plus SHA256SUMS and publishes them to the tag's GitHub Release
+# with GITHUB_TOKEN. A test tag v0.0.0* (e.g. v0.0.0-test.1) runs the same
+# build and checks on the tag but is never published.
+# Pull requests and manual runs build the same assets for a
+# dry-run tag (v0.0.0-dryrun.<run>) and check checksums and `shiftgate version`
+# without publishing anything. Hosts pull published assets themselves; this
+# workflow never reaches a host.
+on:
+  push:
+    tags: ['v*']
+  pull_request:
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+jobs:
+  build:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          ref: ${{ github.sha }}
+          persist-credentials: false
+      - uses: actions/setup-go@v5
+        with:
+          go-version: '1.27.x'
+          cache: true
+      - name: Resolve release tag
+        env:
+          EVENT: ${{ github.event_name }}
+          REF_TYPE: ${{ github.ref_type }}
+          REF_NAME: ${{ github.ref_name }}
+          RUN_NUMBER: ${{ github.run_number }}
+        run: |
+          if [ "$EVENT" = push ] && [ "$REF_TYPE" = tag ]; then
+            echo "RELEASE_TAG=$REF_NAME" >> "$GITHUB_ENV"
+          else
+            echo "RELEASE_TAG=v0.0.0-dryrun.$RUN_NUMBER" >> "$GITHUB_ENV"
+          fi
+      - name: Build release assets
+        run: sh scripts/build-release.sh "$RELEASE_TAG" dist/release
+      - name: Verify assets, SHA256SUMS and version output
+        run: |
+          sh scripts/verify-release.sh "$RELEASE_TAG" dist/release
+          cat dist/release/SHA256SUMS
+      - name: Keep assets for publish
+        if: github.event_name == 'push' && github.ref_type == 'tag' && !startsWith(github.ref_name, 'v0.0.0')
+        uses: actions/upload-artifact@v4
+        with:
+          name: release-assets
+          path: dist/release/
+          if-no-files-found: error
+          retention-days: 7
+
+  test:
+    if: github.event_name == 'push' && github.ref_type == 'tag' && !startsWith(github.ref_name, 'v0.0.0')
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          ref: ${{ github.sha }}
+          persist-credentials: false
+      - uses: actions/setup-go@v5
+        with:
+          go-version: '1.27.x'
+          cache: true
+      - run: go vet ./...
+      - run: go test -race ./...
+
+  publish:
+    needs: [build, test]
+    if: github.event_name == 'push' && github.ref_type == 'tag' && !startsWith(github.ref_name, 'v0.0.0')
+    runs-on: ubuntu-latest
+    permissions:
+      contents: write
+    steps:
+      - uses: actions/download-artifact@v4
+        with:
+          name: release-assets
+          path: dist/release
+      # The checkouts above use github.sha; refuse if the tag was moved since.
+      - name: Check the tag still points at the built commit
+        env:
+          GH_TOKEN: ${{ github.token }}
+          TAG: ${{ github.ref_name }}
+        run: |
+          tagged=$(gh api "repos/$GITHUB_REPOSITORY/commits/$TAG" -q .sha)
+          if [ "$tagged" != "$GITHUB_SHA" ]; then
+            echo "tag $TAG now points at $tagged, but the assets were built from $GITHUB_SHA" >&2
+            exit 1
+          fi
+      - name: Publish release assets
+        env:
+          GH_TOKEN: ${{ github.token }}
+          RELEASE_TAG: ${{ github.ref_name }}
+        # A -suffix tag (v1.2.3-rc.1) is a pre-release: never "Latest", so
+        # hosts that follow the latest release do not pick it up.
+        run: |
+          set --
+          case "$RELEASE_TAG" in *-*) set -- --prerelease ;; esac
+          gh release create "$RELEASE_TAG" dist/release/* --repo "$GITHUB_REPOSITORY" --verify-tag --generate-notes "$@"
