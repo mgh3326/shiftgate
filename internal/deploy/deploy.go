@@ -263,11 +263,6 @@ func (g *Gate) Deploy(ctx context.Context, name, digest string) (*Result, error)
 
 	op := &state.Intent{OpID: state.NewOpID(), Op: "deploy", Phase: state.PhaseStarting,
 		From: cur.Active, To: state.Slot{Color: target, Digest: digest}, StartedAt: g.now()}
-	// The target slot is the previous colour: once it is replaced, rollback
-	// to it is impossible, so record that before touching the container.
-	if cur.Previous != nil && cur.Previous.Color == target {
-		cur.RollbackAvailable = false
-	}
 	cur.Pending = op
 	if err := g.Store.Save(cur); err != nil {
 		return nil, fail(CodeFailed, "write intent: %v", err)
@@ -277,6 +272,16 @@ func (g *Gate) Deploy(ctx context.Context, name, digest string) (*Result, error)
 	ref := svc.Image + "@" + digest
 	if err := g.Docker.Pull(ctx, ref); err != nil {
 		return nil, g.abort(ss, "pull_failed", err, false)
+	}
+	// The target slot is the previous colour: once its container is
+	// replaced, rollback to it is impossible. Record that durably right
+	// before the removal, not earlier, so a failed pull keeps rollback.
+	if cur.Previous != nil && cur.Previous.Color == target && cur.RollbackAvailable {
+		cur.RollbackAvailable = false
+		if err := g.Store.Save(cur); err != nil {
+			cur.RollbackAvailable = true
+			return nil, g.abort(ss, "intent_write_failed", err, false)
+		}
 	}
 	_ = g.Docker.Remove(ctx, tname) // absent is fine; ownership checked above
 	if err := g.Docker.Run(ctx, RunSpec(svc, target, digest)); err != nil {

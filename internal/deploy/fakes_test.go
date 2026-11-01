@@ -29,6 +29,7 @@ type fakeDocker struct {
 	pullGate   chan struct{} // when non-nil, Pull blocks until closed
 	pullEnter  chan struct{} // signalled when Pull starts
 	failRemove map[string]bool
+	pullErr    error
 }
 
 type fakeCtr struct {
@@ -54,6 +55,9 @@ func (d *fakeDocker) Pull(ctx context.Context, ref string) error {
 	}
 	if d.pullGate != nil {
 		<-d.pullGate
+	}
+	if d.pullErr != nil {
+		return d.pullErr
 	}
 	_, digest, _ := strings.Cut(ref, "@")
 	d.mu.Lock()

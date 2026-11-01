@@ -170,5 +170,11 @@ and 3.1.
   them. This is by design.
 - **One host, no daemon.** shiftgate does not coordinate several hosts or
   several services as one release.
+- **The config install is not atomic for an existing file.** It overwrites
+  in place so a file bind-mounted into an HAProxy container sees the new
+  content (a rename would leave the mount on the old inode). A crash
+  mid-write can leave a partial file. `haproxy.cfg.previous` is written
+  first, the running HAProxy keeps its loaded config, and the next
+  `render` rewrites the file.
 - **No reconstruction from a digest.** When the previous container is gone,
   rollback is refused; deploy the old digest explicitly instead.

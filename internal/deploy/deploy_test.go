@@ -157,6 +157,38 @@ func TestRollbackRefusedWhenPreviousGoneOrUnhealthy(t *testing.T) {
 	}
 }
 
+// A pull failure must not cost the rollback target: the previous colour's
+// container is untouched until the new image is on the host.
+func TestPullFailureKeepsRollback(t *testing.T) {
+	h := newHarness(t)
+	h.mustDeploy(1)
+	h.mustDeploy(2) // active green@2, previous blue@1
+	h.docker.pullErr = errors.New("registry unreachable")
+	if _, err := h.gate.Deploy(context.Background(), "web", digest(3)); deploy.ExitCode(err) != deploy.CodeFailed {
+		t.Fatalf("pull failure: %v", err)
+	}
+	st := h.state()
+	if !st.RollbackAvailable || st.Previous.Digest != digest(1) || st.LastResult != "pull_failed" || st.Pending != nil {
+		t.Fatalf("state after pull failure: %+v", st)
+	}
+	if exists, _ := h.docker.running("shiftgate-web-blue"); !exists {
+		t.Fatal("previous container must be untouched")
+	}
+	h.docker.pullErr = nil
+	if _, err := h.gate.Rollback(context.Background(), "web"); err != nil {
+		t.Fatalf("rollback after a failed pull: %v", err)
+	}
+	// Once the previous colour is actually replaced, rollback is gone.
+	h.health.markBad(digest(4))
+	h.mustDeploy(2) // active green@2 again, previous blue@1
+	if _, err := h.gate.Deploy(context.Background(), "web", digest(4)); err == nil {
+		t.Fatal("unhealthy deploy should fail")
+	}
+	if h.state().RollbackAvailable {
+		t.Fatal("rollback must be unavailable after its container was replaced")
+	}
+}
+
 // Acceptance 4.
 func TestConcurrentDeploySecondRefusedByLock(t *testing.T) {
 	h := newHarness(t)
