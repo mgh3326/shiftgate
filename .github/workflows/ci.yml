@@ -1,0 +1,59 @@
+name: CI
+on:
+  push:
+    branches: [main]
+  pull_request:
+permissions:
+  contents: read
+jobs:
+  vet:
+    name: vet
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-go@v5
+        with:
+          go-version: '1.27.x'
+          cache: true
+      - run: test -z "$(gofmt -l .)" || { gofmt -l .; exit 1; }
+      - run: go vet ./...
+  test:
+    name: test (haproxy + docker)
+    runs-on: ubuntu-latest
+    env:
+      # Fail instead of skipping when a dependency is missing.
+      SHIFTGATE_REQUIRE_HAPROXY: '1'
+      SHIFTGATE_REQUIRE_DOCKER: '1'
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-go@v5
+        with:
+          go-version: '1.27.x'
+          cache: true
+      - name: Install HAProxy
+        run: |
+          sudo apt-get update -qq
+          sudo apt-get install -y -qq haproxy
+          sudo systemctl stop haproxy || true
+          haproxy -v
+      - run: docker version --format '{{.Server.Version}}'
+      - run: go test -race -v ./...
+  build:
+    name: build-${{ matrix.goos }}-${{ matrix.goarch }}
+    runs-on: ubuntu-latest
+    strategy:
+      fail-fast: false
+      matrix:
+        goos: [linux, darwin]
+        goarch: [amd64, arm64]
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-go@v5
+        with:
+          go-version: '1.27.x'
+          cache: true
+      - run: go build -trimpath -ldflags='-s -w' -o dist/shiftgate-${{ matrix.goos }}-${{ matrix.goarch }} ./cmd/shiftgate
+        env:
+          CGO_ENABLED: '0'
+          GOOS: ${{ matrix.goos }}
+          GOARCH: ${{ matrix.goarch }}

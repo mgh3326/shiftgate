@@ -1,0 +1,63 @@
+# The first adopter's current single-VM layout, expressed in shiftgate terms
+# (see docs/design.md, "First adopter mapping"). Names are generic and the
+# tailnet address is a documentation address (RFC 5737).
+#
+# - "api" and "mcp" are blue-green: two colour ports each, host networking,
+#   the app binds the colour port on loopback.
+# - five fixed-profile units are static upstreams: HAProxy is their only
+#   tailnet-facing listener; their containers are not managed by shiftgate.
+state_dir: /var/lib/shiftgate
+keep_digests: 3
+haproxy:
+  config: /srv/app-run/haproxy.cfg
+  # HAProxy runs as a container with the config bind-mounted; the admin
+  # socket directory is bind-mounted too, so the host and HAProxy see
+  # different paths for the same socket.
+  socket: /srv/app-run/haproxy-run/admin.sock
+  socket_in_config: /var/run/haproxy/admin.sock
+  check: ["docker", "run", "--rm", "-v", "{config}:/usr/local/etc/haproxy/haproxy.cfg:ro",
+          "haproxy:3.1-alpine", "haproxy", "-c", "-f", "/usr/local/etc/haproxy/haproxy.cfg"]
+  reload: ["docker", "kill", "-s", "HUP", "app-haproxy"]
+  # The render guard: loopback and one tailnet address, nothing else.
+  allowed_binds: ["127.0.0.1", "192.0.2.10"]
+  log: stdout format raw local0
+  timeouts: {connect: 5s, client: 1h, server: 1h, tunnel: 1h, http_request: 10s}
+
+services:
+  - name: api
+    image: ghcr.io/example/app
+    frontend: ft_api
+    backend: bk_api
+    binds: ["127.0.0.1:8000", "192.0.2.10:8000"]
+    ports: {blue: 8001, green: 8002}
+    network: host
+    env_files: [/srv/app-run/.env.runtime, /srv/app-run/.env.secrets]
+    args: ["/app/.venv/bin/uvicorn", "app.main:app", "--host", "127.0.0.1", "--port", "{port}"]
+    health: {http: /healthz, timeout: 60s, interval: 2s}
+    check: {inter: 5s, fall: 2, rise: 1}
+    drain_timeout: 120s
+
+  - name: mcp
+    image: ghcr.io/example/app
+    frontend: ft_mcp
+    backend: bk_mcp
+    binds: ["127.0.0.1:8765", "192.0.2.10:8765"]
+    ports: {blue: 8766, green: 8767}
+    network: host
+    env_files: [/srv/app-run/.env.runtime, /srv/app-run/.env.secrets]
+    env: {MCP_HOST: 127.0.0.1, MCP_PORT: "{port}", MCP_TYPE: streamable-http, MCP_PATH: /mcp, APP_COLOR: "{color}"}
+    args: ["python", "-m", "app.mcp_server.main"]
+    health: {http: /health, timeout: 60s, interval: 2s}
+    check: {inter: 5s, fall: 2, rise: 1}
+    drain_timeout: 1h
+
+  - {name: mcp-unit-1, backend: bk_mcp_unit_1, binds: ["192.0.2.10:8768"], upstream: "127.0.0.1:8768",
+     health: {http: /health}, check: {inter: 5s, fall: 2, rise: 1}}
+  - {name: mcp-unit-2, backend: bk_mcp_unit_2, binds: ["192.0.2.10:8769"], upstream: "127.0.0.1:8769",
+     health: {http: /health}, check: {inter: 5s, fall: 2, rise: 1}}
+  - {name: mcp-unit-3, backend: bk_mcp_unit_3, binds: ["192.0.2.10:8770"], upstream: "127.0.0.1:8770",
+     health: {http: /health}, check: {inter: 5s, fall: 2, rise: 1}}
+  - {name: mcp-unit-4, backend: bk_mcp_unit_4, binds: ["192.0.2.10:8771"], upstream: "127.0.0.1:8771",
+     health: {http: /health}, check: {inter: 5s, fall: 2, rise: 1}}
+  - {name: mcp-unit-5, backend: bk_mcp_unit_5, binds: ["192.0.2.10:8772"], upstream: "127.0.0.1:8772",
+     health: {http: /health}, check: {inter: 5s, fall: 2, rise: 1}}

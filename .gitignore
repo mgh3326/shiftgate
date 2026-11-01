@@ -1,0 +1,4 @@
+dist/
+/shiftgate
+*.test
+coverage.out
