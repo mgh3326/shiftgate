@@ -1,0 +1,125 @@
+# Reusable workflow (example — not wired to any repository).
+#
+# Builds the caller's image, pushes it to GHCR, joins the tailnet and runs
+# `shiftgate deploy <service> --digest <pushed digest>` on the host over SSH.
+# Copy it to .github/workflows/shiftgate-deploy.yml in your repository and
+# call it from another workflow (see caller.yml next to this file).
+#
+# Secrets the caller passes:
+#   TS_OAUTH_CLIENT_ID / TS_OAUTH_SECRET  Tailscale OAuth client (tag:ci)
+#   DEPLOY_SSH_KEY                        private key of the deploy user
+#   DEPLOY_KNOWN_HOSTS                    the host's known_hosts line(s)
+name: shiftgate deploy
+
+on:
+  workflow_call:
+    inputs:
+      service:
+        description: service name in the host's services.yaml
+        required: true
+        type: string
+      host:
+        description: tailnet host name of the deploy target
+        required: true
+        type: string
+      user:
+        description: SSH user on the host
+        required: false
+        type: string
+        default: deploy
+      context:
+        description: docker build context
+        required: false
+        type: string
+        default: .
+    secrets:
+      TS_OAUTH_CLIENT_ID:
+        required: true
+      TS_OAUTH_SECRET:
+        required: true
+      DEPLOY_SSH_KEY:
+        required: true
+      DEPLOY_KNOWN_HOSTS:
+        required: true
+    outputs:
+      digest:
+        description: the deployed image digest
+        value: ${{ jobs.deploy.outputs.digest }}
+
+permissions:
+  contents: read
+  packages: write
+
+concurrency:
+  # One deploy per service at a time from CI; shiftgate's lock is the backstop.
+  group: shiftgate-${{ inputs.host }}-${{ inputs.service }}
+  cancel-in-progress: false
+
+jobs:
+  deploy:
+    runs-on: ubuntu-latest
+    outputs:
+      digest: ${{ steps.build.outputs.digest }}
+    steps:
+      - name: Validate inputs
+        env:
+          SERVICE: ${{ inputs.service }}
+          HOST: ${{ inputs.host }}
+          DEPLOY_USER: ${{ inputs.user }}
+        run: |
+          [[ "$SERVICE" =~ ^[a-z][a-z0-9-]{0,40}$ ]] || { echo "bad service name"; exit 1; }
+          [[ "$HOST" =~ ^[A-Za-z0-9][A-Za-z0-9.-]{0,252}$ ]] || { echo "bad host"; exit 1; }
+          [[ "$DEPLOY_USER" =~ ^[a-z_][a-z0-9_-]{0,31}$ ]] || { echo "bad user"; exit 1; }
+
+      - uses: actions/checkout@v4
+
+      - uses: docker/setup-buildx-action@v3
+
+      - uses: docker/login-action@v3
+        with:
+          registry: ghcr.io
+          username: ${{ github.actor }}
+          password: ${{ secrets.GITHUB_TOKEN }}
+
+      - name: Image name
+        id: image
+        run: echo "name=ghcr.io/${GITHUB_REPOSITORY,,}" >> "$GITHUB_OUTPUT"
+
+      - name: Build and push
+        id: build
+        uses: docker/build-push-action@v6
+        with:
+          context: ${{ inputs.context }}
+          push: true
+          tags: |
+            ${{ steps.image.outputs.name }}:sha-${{ github.sha }}
+            ${{ steps.image.outputs.name }}:main
+
+      - name: Join the tailnet
+        uses: tailscale/github-action@v3
+        with:
+          oauth-client-id: ${{ secrets.TS_OAUTH_CLIENT_ID }}
+          oauth-secret: ${{ secrets.TS_OAUTH_SECRET }}
+          tags: tag:ci
+
+      - name: Deploy with shiftgate
+        env:
+          SERVICE: ${{ inputs.service }}
+          HOST: ${{ inputs.host }}
+          DEPLOY_USER: ${{ inputs.user }}
+          DIGEST: ${{ steps.build.outputs.digest }}
+          SSH_KEY: ${{ secrets.DEPLOY_SSH_KEY }}
+          KNOWN_HOSTS: ${{ secrets.DEPLOY_KNOWN_HOSTS }}
+        run: |
+          [[ "$DIGEST" =~ ^sha256:[0-9a-f]{64}$ ]] || { echo "build produced no digest"; exit 1; }
+          install -m 700 -d ~/.ssh
+          printf '%s\n' "$SSH_KEY" > ~/.ssh/deploy_key && chmod 600 ~/.ssh/deploy_key
+          printf '%s\n' "$KNOWN_HOSTS" > ~/.ssh/known_hosts
+          # With the forced-command wrapper (examples/ssh-forced-command.sh)
+          # the remote side only accepts exactly this command shape.
+          ssh -i ~/.ssh/deploy_key -o IdentitiesOnly=yes -o StrictHostKeyChecking=yes \
+            "$DEPLOY_USER@$HOST" "shiftgate deploy $SERVICE --digest $DIGEST"
+
+      - name: Remove the key
+        if: always()
+        run: rm -f ~/.ssh/deploy_key

@@ -1,0 +1,20 @@
+# Example caller (not wired to any repository): deploy "web" on every push
+# to main. Put it in .github/workflows/deploy.yml next to shiftgate-deploy.yml.
+name: deploy
+on:
+  push:
+    branches: [main]
+permissions:
+  contents: read
+  packages: write
+jobs:
+  web:
+    uses: ./.github/workflows/shiftgate-deploy.yml
+    with:
+      service: web
+      host: app-host-1        # tailnet (MagicDNS) name of the target host
+    secrets:
+      TS_OAUTH_CLIENT_ID: ${{ secrets.TS_OAUTH_CLIENT_ID }}
+      TS_OAUTH_SECRET: ${{ secrets.TS_OAUTH_SECRET }}
+      DEPLOY_SSH_KEY: ${{ secrets.DEPLOY_SSH_KEY }}
+      DEPLOY_KNOWN_HOSTS: ${{ secrets.DEPLOY_KNOWN_HOSTS }}

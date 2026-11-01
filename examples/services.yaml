@@ -1,0 +1,32 @@
+# Minimal services.yaml for one host. Copy to /etc/shiftgate/services.yaml.
+state_dir: /var/lib/shiftgate
+keep_digests: 3
+haproxy:
+  config: /etc/haproxy/haproxy.cfg
+  socket: /run/haproxy/admin.sock
+  check: ["haproxy", "-c", "-f", "{config}"]
+  reload: ["systemctl", "reload", "haproxy"]
+  # Every address a frontend may bind. Anything else is refused, and a
+  # wildcard (0.0.0.0, ::) needs `render --allow-wildcard-bind` or
+  # allow_wildcard_bind: true here.
+  allowed_binds: ["127.0.0.1", "192.0.2.10"]
+
+services:
+  - name: web
+    image: ghcr.io/example/web          # repository only; deploys pin @sha256
+    binds: ["127.0.0.1:8080", "192.0.2.10:8080"]
+    ports: {blue: 18080, green: 18081}  # host ports, published on 127.0.0.1
+    container_port: 8080                # the app listens here; PORT is set to it
+    health: {http: /healthz, expect_status: 200, timeout: 60s, interval: 1s}
+    env_files: [/etc/shiftgate/web.env] # passed to docker by path, never opened
+    run_args: ["--memory=512m"]
+    drain_timeout: 30s
+
+  - name: worker-api
+    image: ghcr.io/example/worker-api
+    mode: tcp
+    binds: ["127.0.0.1:9000"]
+    ports: {blue: 19000, green: 19001}
+    container_port: 9000
+    health: {tcp: true, timeout: 30s}
+    drain_timeout: 10s
