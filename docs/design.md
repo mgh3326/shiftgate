@@ -177,16 +177,23 @@ takes any lock, then takes the same host and service locks as `deploy`
 (so it exits 75 while another operation runs) and decides under them:
 equal to `active` → nothing; equal to `hold` → nothing; otherwise the hold
 is released and the normal deploy runs in the same session. A followed
-deploy that aborts holds its digest, except after `pull_failed` or
-`intent_write_failed`, which say nothing about the image.
+deploy that aborts holds its digest only when the image is at fault
+(`unhealthy`, `target_not_running`, `pre_deploy_failed`) and the run was
+not interrupted. A `pre_deploy` that could not start (a leftover running
+container, a Docker or disk error) aborts as `pre_deploy_refused` and is not
+held.
 
 `check [<svc>] [--heal]` reads `state.json` without a lock. A pending
-intent is reported as a failure only if no process holds the service lock;
-otherwise an operation is running and the service is skipped. It then
+intent is reported as a failure only if no process holds the service lock.
+When an operation holds it and is still in phase `starting` (pull,
+`pre_deploy`), routing is untouched and the active colour is checked as
+usual (a heal finds the lock busy and is reported as not healed); in phase
+`flipping` the service is skipped. It then
 checks the active colour's container (exists, shiftgate's, the active
 digest, running), the health endpoint (`health.timeout`) and HAProxy (ready
 and UP). If a probe fails but `generation` changed meanwhile, a deploy
-committed during the check and the service is skipped. `--heal` restarts
+committed (or a flip started) during the check and the service is
+skipped. `--heal` restarts
 the active container only for a stopped container, a failed health check
 or HAProxy DOWN, under the host and service locks, once, and only if
 `generation` and `active` are unchanged; it then re-checks, giving HAProxy

@@ -288,7 +288,12 @@ func (g *Gate) deployLocked(ctx context.Context, ss *session, digest string) (*R
 	// slot is touched, so a failure leaves routing and rollback intact.
 	if svc.PreDeploy != nil {
 		if err := g.preDeploy(ctx, ss, digest); err != nil {
-			return nil, g.abort(ss, "pre_deploy_failed", err, false)
+			result := "pre_deploy_failed"
+			var refused *preDeployRefused
+			if errors.As(err, &refused) {
+				result = "pre_deploy_refused" // the command never ran
+			}
+			return nil, g.abort(ss, result, err, false)
 		}
 	}
 	// The target slot is the previous colour: once its container is
@@ -686,6 +691,9 @@ func RunSpec(svc *config.Service, c config.Color, digest string) docker.RunSpec 
 }
 
 func logOpts(l config.LogOptions) []string {
+	if l.Driver == config.LogDaemon {
+		return nil
+	}
 	return []string{"max-size=" + l.MaxSize, "max-file=" + strconv.Itoa(l.MaxFile)}
 }
 
@@ -720,19 +728,19 @@ func (g *Gate) preDeploy(ctx context.Context, ss *session, digest string) error 
 	svc, op := ss.svc, ss.cur.Pending
 	spec := PreDeploySpec(svc, op.To.Color, digest)
 	if c, ok, err := g.Docker.Inspect(ctx, spec.Name); err != nil {
-		return fmt.Errorf("inspect %s: %w", spec.Name, err)
+		return refuse("inspect %s: %v", spec.Name, err)
 	} else if ok {
 		if c.Labels[docker.LabelService] != svc.Name || c.Labels[docker.LabelRole] != "pre_deploy" {
-			return fmt.Errorf("container %s exists but is not shiftgate's pre_deploy container of %s; refusing to replace it", spec.Name, svc.Name)
+			return refuse("container %s exists but is not shiftgate's pre_deploy container of %s; refusing to replace it", spec.Name, svc.Name)
 		}
 		if c.Running {
-			return fmt.Errorf("pre_deploy container %s is still running from an earlier operation; stop it first", spec.Name)
+			return refuse("pre_deploy container %s is still running from an earlier operation; stop it first", spec.Name)
 		}
 		_ = g.Docker.Remove(ctx, spec.Name) // leftover of an interrupted run
 	}
 	f, err := g.Store.CreateOpLog(svc.Name, op.OpID)
 	if err != nil {
-		return fmt.Errorf("create op log: %w", err)
+		return refuse("create op log: %v", err)
 	}
 	defer f.Close()
 	op.OpLog = f.Name()
@@ -751,6 +759,16 @@ func (g *Gate) preDeploy(ctx context.Context, ss *session, digest string) error 
 		return fmt.Errorf("pre_deploy: %v (output in %s)", err, op.OpLog)
 	}
 	return nil
+}
+
+// preDeployRefused means the pre_deploy command never ran (the host was
+// not ready for it), as opposed to running and failing.
+type preDeployRefused struct{ err error }
+
+func (e *preDeployRefused) Error() string { return e.err.Error() }
+
+func refuse(format string, a ...any) error {
+	return &preDeployRefused{fmt.Errorf(format, a...)}
 }
 
 // capWriter writes at most left bytes and drops the rest.

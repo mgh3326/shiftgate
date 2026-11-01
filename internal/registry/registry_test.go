@@ -21,6 +21,9 @@ func TestSplit(t *testing.T) {
 		"localhost/a/b":                {"localhost", "a/b"},
 		"nginx":                        {"docker.io", "library/nginx"},
 		"example/web":                  {"docker.io", "example/web"},
+		"docker.io/nginx":              {"docker.io", "library/nginx"},
+		"docker.io/library/nginx":      {"docker.io", "library/nginx"},
+		"index.docker.io/example/web":  {"docker.io", "example/web"},
 	} {
 		if h, r := registry.Split(in); h != want[0] || r != want[1] {
 			t.Errorf("Split(%q) = %q %q, want %v", in, h, r, want)

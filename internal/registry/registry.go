@@ -98,6 +98,9 @@ func ValidTag(tag string) bool { return tagRE.MatchString(tag) }
 // the library/ prefix.
 func Split(image string) (host, repo string) {
 	first, rest, ok := strings.Cut(image, "/")
+	if ok && (first == "docker.io" || first == "index.docker.io") {
+		return Split(rest) // docker.io/nginx is library/nginx, like docker pull
+	}
 	if ok && (strings.ContainsAny(first, ".:") || first == "localhost") {
 		return first, rest
 	}

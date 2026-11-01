@@ -29,9 +29,10 @@ type FollowResult struct {
 	Deploy  *Result     `json:"deploy,omitempty"`
 }
 
-// noHoldResults are deploy failures that say nothing about the image (the
-// registry or the network failed), so the next follow retries the digest.
-var noHoldResults = map[string]bool{"pull_failed": true, "intent_write_failed": true}
+// holdResults are the aborts that point at the image itself. Anything else
+// (pull, Docker, HAProxy, disk, a pre_deploy that could not start, an
+// interrupted run) is the host's problem, and the next follow retries.
+var holdResults = map[string]bool{"unhealthy": true, "target_not_running": true, "pre_deploy_failed": true}
 
 // Follow resolves svc's image at tag and deploys the digest when it differs
 // from the active one. It is a no-op when the digest is active or held. The
@@ -87,7 +88,7 @@ func (g *Gate) Follow(ctx context.Context, name, tag string) (*FollowResult, err
 	}
 	dres, err := g.deployLocked(ctx, ss, digest)
 	if err != nil {
-		if ExitCode(err) == CodeFailed && ss.aborted != "" && !noHoldResults[ss.aborted] {
+		if ExitCode(err) == CodeFailed && holdResults[ss.aborted] && ctx.Err() == nil {
 			// Do not retry the same failing image (and its pre_deploy) on
 			// every follow run; a new push or an explicit deploy clears it.
 			cur.Hold = &state.Hold{Digest: digest, Reason: "deploy_failed:" + ss.aborted, OpID: ss.abortedOp, At: g.now()}

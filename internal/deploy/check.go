@@ -27,6 +27,8 @@ const (
 	checkSkipLock = "an operation is in progress"
 )
 
+func flipping(s *state.State) bool { return s.Pending != nil && s.Pending.Phase != state.PhaseStarting }
+
 func healable(kind string) bool {
 	return kind == KindStopped || kind == KindUnhealthy || kind == KindDown
 }
@@ -96,7 +98,7 @@ func (g *Gate) checkOne(ctx context.Context, svc *config.Service, heal bool) Che
 	}
 	// A deploy may have committed while we probed (the old colour is being
 	// drained and stopped): that is not a failure of the active colour.
-	if now, err := g.Store.Load(svc.Name); err == nil && (now.Generation != cur.Generation || now.Pending != nil) {
+	if now, err := g.Store.Load(svc.Name); err == nil && (now.Generation != cur.Generation || flipping(now) || (now.Pending != nil && cur.Pending == nil)) {
 		r.Skipped = "state changed during the check (a deploy or rollback ran)"
 		return r
 	}
@@ -120,6 +122,12 @@ func (g *Gate) checkState(svc *config.Service) (cur *state.State, skip, kind, re
 	if p := cur.Pending; p != nil {
 		lk, err := g.Store.LockService(svc.Name)
 		if errors.Is(err, state.ErrLocked) {
+			// An operation is running. Before its flip, routing is untouched
+			// and the active colour still serves: keep watching it (a heal
+			// would find the lock busy). During the flip, skip.
+			if p.Phase == state.PhaseStarting && cur.Active != nil {
+				return cur, "", "", ""
+			}
 			return nil, checkSkipLock, "", ""
 		}
 		if err != nil {
