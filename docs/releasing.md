@@ -3,8 +3,10 @@
 ## Cut a release
 
 1. Merge the change to `main`.
-2. Tag the merge commit and push the tag:
+2. Fetch `main` so that `origin/main` is the merge commit, then tag it and
+   push the tag:
    ```sh
+   git fetch origin main
    git tag vMAJOR.MINOR.PATCH origin/main
    git push origin vMAJOR.MINOR.PATCH
    ```
