@@ -8,6 +8,7 @@ import (
 	"encoding/json"
 	"errors"
 	"fmt"
+	"io"
 	"maps"
 	"os/exec"
 	"slices"
@@ -21,6 +22,8 @@ const (
 	LabelService = "shiftgate.service"
 	LabelColor   = "shiftgate.color"
 	LabelDigest  = "shiftgate.digest"
+	// LabelRole marks a container that is not a colour (pre_deploy).
+	LabelRole = "shiftgate.role"
 )
 
 // RunSpec is everything `docker run` needs for one colour.
@@ -34,21 +37,35 @@ type RunSpec struct {
 	Network  string // "" or "host"
 	RunArgs  []string
 	Args     []string
+	// LogOpts are json-file --log-opt values ("max-size=10m"); when set the
+	// log driver is pinned to json-file so the options always apply.
+	LogOpts []string
+	// OneShot runs in the foreground with --rm and no restart policy.
+	OneShot bool
 }
 
 // Container is what Inspect reports.
 type Container struct {
-	ID      string
-	Running bool
-	Labels  map[string]string
+	ID           string
+	Running      bool
+	Status       string // created | running | paused | restarting | exited | dead
+	StartedAt    time.Time
+	RestartCount int // restarts by Docker's restart policy
+	Labels       map[string]string
 }
 
 // Engine is the container runtime surface the deploy logic needs.
 type Engine interface {
 	Pull(ctx context.Context, ref string) error
 	Run(ctx context.Context, spec RunSpec) error
+	// RunOnce runs a OneShot spec to completion, writing its combined
+	// output to out. A non-zero exit is an error. When ctx ends first the
+	// container is removed.
+	RunOnce(ctx context.Context, spec RunSpec, out io.Writer) error
 	Start(ctx context.Context, name string) error
 	Stop(ctx context.Context, name string, timeout time.Duration) error
+	// Restart stops (with timeout) and starts the container again.
+	Restart(ctx context.Context, name string, timeout time.Duration) error
 	Remove(ctx context.Context, name string) error
 	// Inspect returns ok=false when the container does not exist.
 	Inspect(ctx context.Context, name string) (c Container, ok bool, err error)
@@ -79,9 +96,12 @@ func (c CLI) Pull(ctx context.Context, ref string) error {
 	return err
 }
 
-// Args builds the docker run argument list (exported for tests and docs).
+// ArgList builds the docker run argument list (exported for tests and docs).
 func (s RunSpec) ArgList() []string {
 	args := []string{"run", "-d", "--name", s.Name, "--restart", "unless-stopped"}
+	if s.OneShot {
+		args = []string{"run", "--rm", "--name", s.Name}
+	}
 	for _, k := range sortedKeys(s.Labels) {
 		args = append(args, "--label", k+"="+s.Labels[k])
 	}
@@ -97,6 +117,12 @@ func (s RunSpec) ArgList() []string {
 	if s.Publish != "" {
 		args = append(args, "-p", s.Publish)
 	}
+	if len(s.LogOpts) > 0 {
+		args = append(args, "--log-driver", "json-file")
+		for _, o := range s.LogOpts {
+			args = append(args, "--log-opt", o)
+		}
+	}
 	args = append(args, s.RunArgs...)
 	args = append(args, s.Image)
 	return append(args, s.Args...)
@@ -104,6 +130,34 @@ func (s RunSpec) ArgList() []string {
 
 func (c CLI) Run(ctx context.Context, spec RunSpec) error {
 	_, err := c.run(ctx, spec.ArgList()...)
+	return err
+}
+
+func (c CLI) RunOnce(ctx context.Context, spec RunSpec, out io.Writer) error {
+	if !spec.OneShot {
+		return errors.New("RunOnce needs a OneShot spec")
+	}
+	bin := c.Bin
+	if bin == "" {
+		bin = "docker"
+	}
+	args := spec.ArgList()
+	cmd := exec.CommandContext(ctx, bin, args...)
+	cmd.Stdout, cmd.Stderr = out, out
+	err := cmd.Run()
+	if ctx.Err() != nil {
+		// Killing the CLI does not stop the container; remove it.
+		_, _ = c.run(context.WithoutCancel(ctx), "rm", "-f", spec.Name)
+		return fmt.Errorf("docker run %s: %w", spec.Name, ctx.Err())
+	}
+	if err != nil {
+		return fmt.Errorf("docker run %s: %w", spec.Name, err)
+	}
+	return nil
+}
+
+func (c CLI) Restart(ctx context.Context, name string, timeout time.Duration) error {
+	_, err := c.run(ctx, "restart", "--time", strconv.Itoa(int(timeout.Seconds())), name)
 	return err
 }
 
@@ -130,15 +184,30 @@ func (c CLI) Inspect(ctx context.Context, name string) (Container, bool, error) 
 		}
 		return Container{}, false, err
 	}
+	return parseInspect(name, out)
+}
+
+func parseInspect(name, out string) (Container, bool, error) {
 	var raw struct {
-		ID     string `json:"Id"`
-		State  struct{ Running bool }
+		ID           string `json:"Id"`
+		RestartCount int
+		State        struct {
+			Running   bool
+			Status    string
+			StartedAt string
+		}
 		Config struct{ Labels map[string]string }
 	}
 	if err := json.Unmarshal([]byte(out), &raw); err != nil {
 		return Container{}, false, fmt.Errorf("docker inspect %s: %w", name, err)
 	}
-	return Container{ID: raw.ID, Running: raw.State.Running, Labels: raw.Config.Labels}, true, nil
+	c := Container{ID: raw.ID, Running: raw.State.Running, Status: raw.State.Status,
+		RestartCount: raw.RestartCount, Labels: raw.Config.Labels}
+	// Docker reports "0001-01-01T00:00:00Z" for a never-started container.
+	if t, err := time.Parse(time.RFC3339Nano, raw.State.StartedAt); err == nil && t.Year() > 1 {
+		c.StartedAt = t
+	}
+	return c, true, nil
 }
 
 func (c CLI) ImageDigests(ctx context.Context, repo string) ([]string, error) {

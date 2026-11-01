@@ -4,6 +4,7 @@ import (
 	"context"
 	"errors"
 	"fmt"
+	"time"
 
 	"github.com/mgh3326/shiftgate/internal/config"
 	"github.com/mgh3326/shiftgate/internal/docker"
@@ -19,7 +20,21 @@ type ServiceStatus struct {
 	State      *state.State            `json:"state,omitempty"`
 	Servers    map[string]ServerStatus `json:"servers,omitempty"`
 	Containers map[string]string       `json:"containers,omitempty"`
-	Errors     []string                `json:"errors,omitempty"`
+	// Colors is the per-colour container detail for exporters.
+	Colors map[string]ColorStatus `json:"colors,omitempty"`
+	// LastOp is the newest swaps.log record: deploy, rollback, recover or
+	// heal, with its result.
+	LastOp *state.SwapRecord `json:"last_op,omitempty"`
+	Errors []string          `json:"errors,omitempty"`
+}
+
+// ColorStatus is one colour's container as Docker reports it.
+type ColorStatus struct {
+	State         string     `json:"state"` // absent | running | exited | restarting | …
+	Digest        string     `json:"digest,omitempty"`
+	StartedAt     *time.Time `json:"started_at,omitempty"`
+	UptimeSeconds int64      `json:"uptime_seconds"` // 0 unless running
+	RestartCount  int        `json:"restart_count"`  // restarts by Docker's restart policy
 }
 
 // ServerStatus is HAProxy's live view of one server.
@@ -41,7 +56,13 @@ func (g *Gate) Status(ctx context.Context) []ServiceStatus {
 			case !errors.Is(err, state.ErrNoState):
 				ss.Errors = append(ss.Errors, err.Error())
 			}
+			if r, err := g.Store.LastSwap(s.Name); err != nil {
+				ss.Errors = append(ss.Errors, err.Error())
+			} else {
+				ss.LastOp = r
+			}
 			ss.Containers = map[string]string{}
+			ss.Colors = map[string]ColorStatus{}
 			for _, c := range []config.Color{config.Blue, config.Green} {
 				ct, ok, err := g.Docker.Inspect(ctx, s.ContainerName(c))
 				switch {
@@ -49,10 +70,21 @@ func (g *Gate) Status(ctx context.Context) []ServiceStatus {
 					ss.Errors = append(ss.Errors, err.Error())
 				case !ok:
 					ss.Containers[string(c)] = "absent"
-				case ct.Running:
-					ss.Containers[string(c)] = "running"
+					ss.Colors[string(c)] = ColorStatus{State: "absent"}
 				default:
-					ss.Containers[string(c)] = "stopped"
+					ss.Containers[string(c)] = map[bool]string{true: "running", false: "stopped"}[ct.Running]
+					cs := ColorStatus{State: ct.Status, Digest: ct.Labels[docker.LabelDigest], RestartCount: ct.RestartCount}
+					if cs.State == "" {
+						cs.State = ss.Containers[string(c)]
+					}
+					if !ct.StartedAt.IsZero() {
+						t := ct.StartedAt.UTC()
+						cs.StartedAt = &t
+						if ct.Running {
+							cs.UptimeSeconds = max(int64(g.now().Sub(t)/time.Second), 0)
+						}
+					}
+					ss.Colors[string(c)] = cs
 				}
 			}
 		}

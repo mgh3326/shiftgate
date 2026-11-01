@@ -114,7 +114,9 @@ func TestRenderedConfigPassesHAProxyCheck(t *testing.T) {
 			dir := t.TempDir()
 			f.HAProxy.Config = filepath.Join(dir, "haproxy.cfg")
 			f.HAProxy.Check = argv
-			f.HAProxy.SocketInConfig = filepath.Join(dir, "admin.sock")
+			// haproxy -c parses but never binds the socket; the path must
+			// fit HAProxy's limit, which macOS temp dirs exceed.
+			f.HAProxy.SocketInConfig = "/run/shiftgate-test/admin.sock"
 			enabled := map[string]config.Color{}
 			for _, s := range f.Services {
 				if !s.Static() {

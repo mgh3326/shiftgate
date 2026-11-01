@@ -1,6 +1,7 @@
 # Minimal services.yaml for one host. Copy to /etc/shiftgate/services.yaml.
 state_dir: /var/lib/shiftgate
 keep_digests: 3
+log: {max_size: 10m, max_file: 3}       # json-file limits for every container (the default)
 haproxy:
   config: /etc/haproxy/haproxy.cfg
   socket: /run/haproxy/admin.sock
@@ -21,6 +22,10 @@ services:
     env_files: [/etc/shiftgate/web.env] # passed to docker by path, never opened
     run_args: ["--memory=512m"]
     drain_timeout: 30s
+    # Database migrations before the new colour starts (old colour still
+    # serving, so they must be backward compatible). Uncomment to use.
+    # pre_deploy: {args: ["./migrate", "up"], timeout: 10m}
+    # registry_auth_file: /etc/shiftgate/registry.env   # follow on a private image
 
   - name: worker-api
     image: ghcr.io/example/worker-api

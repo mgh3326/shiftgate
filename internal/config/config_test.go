@@ -54,6 +54,11 @@ func TestRejects(t *testing.T) {
 		"sub-ms check interval":  {`health: {http: /healthz}`, "health: {http: /healthz}\n    check: {inter: 500us}", "at least 1ms"},
 		"empty service entry":    {`services:`, "services:\n  - ~", "services[0] is empty"},
 		"health path injection":  {`health: {http: /healthz}`, `health: {http: "/x\nbind 0.0.0.0:1"}`, "absolute path"},
+		"log size":               {`haproxy:`, "log: {max_size: 10MB}\nhaproxy:", "log.max_size"},
+		"log files":              {`health: {http: /healthz}`, "health: {http: /healthz}\n    log: {max_file: -1}", "log.max_file"},
+		"log-opt in run_args":    {`health: {http: /healthz}`, "health: {http: /healthz}\n    run_args: [\"--log-opt=max-size=1g\"]", "may not set --log-opt"},
+		"empty pre_deploy":       {`health: {http: /healthz}`, "health: {http: /healthz}\n    pre_deploy: {timeout: 1m}", "pre_deploy.args"},
+		"relative registry auth": {`health: {http: /healthz}`, "health: {http: /healthz}\n    registry_auth_file: reg.env", "registry_auth_file"},
 	}
 	for name, c := range cases {
 		t.Run(name, func(t *testing.T) {
@@ -89,5 +94,23 @@ func TestExamplesParse(t *testing.T) {
 		if _, err := config.Load(p); err != nil {
 			t.Fatalf("%s: %v", p, err)
 		}
+	}
+}
+
+func TestLogAndPreDeployDefaults(t *testing.T) {
+	f, err := config.Parse([]byte(strings.Replace(base, "health: {http: /healthz}",
+		"health: {http: /healthz}\n    log: {max_size: 50m}\n    pre_deploy: {args: [migrate]}", 1)))
+	if err != nil {
+		t.Fatal(err)
+	}
+	if f.Log != (config.LogOptions{MaxSize: "10m", MaxFile: 3}) {
+		t.Fatalf("top-level log default: %+v", f.Log)
+	}
+	s := f.Services[0]
+	if s.Log != (config.LogOptions{MaxSize: "50m", MaxFile: 3}) {
+		t.Fatalf("service log override: %+v", s.Log)
+	}
+	if s.PreDeploy == nil || s.PreDeploy.Timeout.D().Minutes() != 10 {
+		t.Fatalf("pre_deploy default timeout: %+v", s.PreDeploy)
 	}
 }

@@ -21,6 +21,8 @@ import (
 	"github.com/mgh3326/shiftgate/internal/docker"
 	"github.com/mgh3326/shiftgate/internal/haproxy"
 	"github.com/mgh3326/shiftgate/internal/health"
+	"github.com/mgh3326/shiftgate/internal/ping"
+	"github.com/mgh3326/shiftgate/internal/registry"
 	"github.com/mgh3326/shiftgate/internal/state"
 )
 
@@ -32,6 +34,10 @@ commands:
   deploy <service> --digest sha256:…   pull, start the idle colour, health-check, flip, drain, stop the old colour
   rollback <service>                   flip back to the previous colour's kept container
   recover <service>                    resolve an operation interrupted mid-flip
+  follow <service> --tag TAG           resolve image:TAG in the registry; deploy it when the digest changed
+  check [<service>] [--heal] [--ping-url-env NAME]
+                                       verify the active colour runs, answers health and is UP in HAProxy;
+                                       --heal restarts a failing active container once (never flips)
   status [--json]                      committed state, HAProxy servers and containers
   render [--no-reload] [--dry-run] [--allow-wildcard-bind]
                                        generate, validate (haproxy -c), install and reload the HAProxy config
@@ -77,6 +83,7 @@ func run(ctx context.Context, args []string, stdout, stderr io.Writer) int {
 		Docker:     docker.CLI{},
 		Router:     haproxy.Runtime{Socket: cfg.HAProxy.Socket},
 		Health:     health.Probe{},
+		Registry:   registry.Client{},
 		Log:        stderr,
 		SyncConfig: true,
 	}
@@ -114,6 +121,51 @@ func run(ctx context.Context, args []string, stdout, stderr io.Writer) int {
 		msg, err2 = g.Recover(ctx, name)
 		if msg != "" {
 			fmt.Fprintln(stdout, msg)
+		}
+	case "follow":
+		tag := fs.String("tag", "", "image tag to follow, e.g. main")
+		name, ok := oneService(fs, rest, stderr)
+		if !ok {
+			return deploy.CodeUsage
+		}
+		if *tag == "" {
+			fmt.Fprintln(stderr, "shiftgate: follow needs --tag TAG")
+			return deploy.CodeUsage
+		}
+		var res *deploy.FollowResult
+		res, err2 = g.Follow(ctx, name, *tag)
+		printFollow(stdout, res)
+	case "check":
+		heal := fs.Bool("heal", false, "restart a failing active container once, then re-check")
+		pingEnv := fs.String("ping-url-env", "", "environment variable holding a healthchecks-style ping URL")
+		args := rest
+		var only string
+		if len(args) > 0 && !strings.HasPrefix(args[0], "-") {
+			only, args = args[0], args[1:]
+		}
+		if fs.Parse(args) != nil || fs.NArg() > 1 || (only != "" && fs.NArg() > 0) {
+			return deploy.CodeUsage
+		}
+		if only == "" {
+			only = fs.Arg(0)
+		}
+		var res []deploy.CheckResult
+		res, err2 = g.Check(ctx, only, *heal)
+		report := checkReport(res)
+		fmt.Fprint(stdout, report)
+		if *pingEnv != "" {
+			// The URL is a secret: it is read here, never printed.
+			if u := os.Getenv(*pingEnv); u != "" {
+				body := report
+				if err2 != nil {
+					body += err2.Error() + "\n"
+				}
+				if perr := ping.Send(ctx, nil, u, err2 == nil, body); perr != nil {
+					fmt.Fprintln(stderr, "shiftgate: warning:", perr)
+				}
+			} else {
+				fmt.Fprintf(stderr, "shiftgate: warning: %s is empty; not pinging\n", *pingEnv)
+			}
 		}
 	case "status":
 		asJSON := fs.Bool("json", false, "print JSON")
@@ -188,6 +240,39 @@ func printResult(w io.Writer, r *deploy.Result) {
 		from = fmt.Sprintf("%s@%s", r.From.Color, r.From.Digest)
 	}
 	fmt.Fprintf(w, "%s %s: %s → %s@%s (op %s)\n", r.Op, r.Service, from, r.To.Color, r.To.Digest, r.OpID)
+}
+
+func printFollow(w io.Writer, r *deploy.FollowResult) {
+	if r == nil {
+		return
+	}
+	switch r.Action {
+	case deploy.FollowUpToDate:
+		fmt.Fprintf(w, "follow %s: %s is %s, already active\n", r.Service, r.Tag, shortDigest(r.Digest))
+	case deploy.FollowHeld:
+		fmt.Fprintf(w, "follow %s: %s is %s, held (%s, op %s); waiting for a new digest\n",
+			r.Service, r.Tag, shortDigest(r.Digest), r.Hold.Reason, r.Hold.OpID)
+	case deploy.FollowDeployed:
+		printResult(w, r.Deploy)
+	}
+}
+
+// checkReport renders one line per service.
+func checkReport(res []deploy.CheckResult) string {
+	var b strings.Builder
+	for _, r := range res {
+		switch {
+		case r.Skipped != "":
+			fmt.Fprintf(&b, "%s: skipped: %s\n", r.Service, r.Skipped)
+		case r.Failed():
+			fmt.Fprintf(&b, "%s: FAIL %s: %s\n", r.Service, r.Kind, r.Reason)
+		case r.Healed:
+			fmt.Fprintf(&b, "%s: healed %s@%s (restarted after: %s)\n", r.Service, r.Color, shortDigest(r.Digest), r.HealedFrom)
+		default:
+			fmt.Fprintf(&b, "%s: ok %s@%s\n", r.Service, r.Color, shortDigest(r.Digest))
+		}
+	}
+	return b.String()
 }
 
 func printStatus(w io.Writer, all []deploy.ServiceStatus, asJSON bool) {
