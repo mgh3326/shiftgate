@@ -1,8 +1,10 @@
 name: Release
 
-# A v* tag builds the four static release binaries (linux/darwin x amd64/arm64)
-# plus SHA256SUMS and publishes them to the tag's GitHub Release with
-# GITHUB_TOKEN. Pull requests and manual runs build the same assets for a
+# A v* tag builds the four CGO-disabled release binaries (linux/darwin x
+# amd64/arm64) plus SHA256SUMS and publishes them to the tag's GitHub Release
+# with GITHUB_TOKEN. A test tag v0.0.0* (e.g. v0.0.0-test.1) runs the same
+# build and checks on the tag but is never published.
+# Pull requests and manual runs build the same assets for a
 # dry-run tag (v0.0.0-dryrun.<run>) and check checksums and `shiftgate version`
 # without publishing anything. Hosts pull published assets themselves; this
 # workflow never reaches a host.
@@ -21,6 +23,7 @@ jobs:
     steps:
       - uses: actions/checkout@v4
         with:
+          ref: ${{ github.sha }}
           persist-credentials: false
       - uses: actions/setup-go@v5
         with:
@@ -45,7 +48,7 @@ jobs:
           sh scripts/verify-release.sh "$RELEASE_TAG" dist/release
           cat dist/release/SHA256SUMS
       - name: Keep assets for publish
-        if: github.event_name == 'push' && github.ref_type == 'tag'
+        if: github.event_name == 'push' && github.ref_type == 'tag' && !startsWith(github.ref_name, 'v0.0.0')
         uses: actions/upload-artifact@v4
         with:
           name: release-assets
@@ -54,11 +57,12 @@ jobs:
           retention-days: 7
 
   test:
-    if: github.event_name == 'push' && github.ref_type == 'tag'
+    if: github.event_name == 'push' && github.ref_type == 'tag' && !startsWith(github.ref_name, 'v0.0.0')
     runs-on: ubuntu-latest
     steps:
       - uses: actions/checkout@v4
         with:
+          ref: ${{ github.sha }}
           persist-credentials: false
       - uses: actions/setup-go@v5
         with:
@@ -69,7 +73,7 @@ jobs:
 
   publish:
     needs: [build, test]
-    if: github.event_name == 'push' && github.ref_type == 'tag'
+    if: github.event_name == 'push' && github.ref_type == 'tag' && !startsWith(github.ref_name, 'v0.0.0')
     runs-on: ubuntu-latest
     permissions:
       contents: write
@@ -78,6 +82,17 @@ jobs:
         with:
           name: release-assets
           path: dist/release
+      # The checkouts above use github.sha; refuse if the tag was moved since.
+      - name: Check the tag still points at the built commit
+        env:
+          GH_TOKEN: ${{ github.token }}
+          TAG: ${{ github.ref_name }}
+        run: |
+          tagged=$(gh api "repos/$GITHUB_REPOSITORY/commits/$TAG" -q .sha)
+          if [ "$tagged" != "$GITHUB_SHA" ]; then
+            echo "tag $TAG now points at $tagged, but the assets were built from $GITHUB_SHA" >&2
+            exit 1
+          fi
       - name: Publish release assets
         env:
           GH_TOKEN: ${{ github.token }}

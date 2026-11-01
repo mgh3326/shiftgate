@@ -38,7 +38,8 @@ want="$tool-darwin-amd64 $tool-darwin-arm64 $tool-linux-amd64 $tool-linux-arm64 
 	fi
 ) || fail "SHA256SUMS does not match the assets"
 
-native="$output/$tool-$(go env GOOS)-$(go env GOARCH)"
+# GOHOSTOS/GOHOSTARCH describe this machine even when GOOS/GOARCH are exported.
+native="$output/$tool-$(go env GOHOSTOS)-$(go env GOHOSTARCH)"
 # shellcheck disable=SC2086 # version_args is a fixed word list
 out=$("$native" $version_args 2>&1) || fail "$native $version_args exited non-zero: $out"
 # The version matches when one whitespace, "(", ")", "=" or ","-separated

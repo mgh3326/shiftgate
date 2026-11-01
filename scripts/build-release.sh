@@ -3,7 +3,8 @@
 #   shiftgate-<os>-<arch> for linux/amd64, linux/arm64, darwin/amd64 and
 #   darwin/arm64, plus SHA256SUMS over those four files.
 #
-# Every binary is static (CGO_ENABLED=0), built with -trimpath, and stamps the
+# Every binary is CGO-disabled (CGO_ENABLED=0: fully static on Linux; Darwin
+# links only the system libSystem), built with -trimpath, and stamps the
 # tag with -X main.version so `shiftgate version` prints it.
 #
 # usage: scripts/build-release.sh TAG OUTPUT_DIR
