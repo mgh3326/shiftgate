@@ -650,3 +650,41 @@ func TestCheckWatchesActiveDuringDeployStartingPhase(t *testing.T) {
 	close(h.docker.pullGate)
 	<-done
 }
+
+// Review fix (#3 thread on check.go): an intent that appears while check
+// probes is an operation in progress only if someone holds the lock; an
+// intent left by a process that died is recovery_required, not a skip.
+func TestCheckIntentWrittenDuringProbe(t *testing.T) {
+	for _, held := range []bool{false, true} {
+		h := newHarness(t)
+		h.mustDeploy(1)
+		h.docker.set("shiftgate-web-blue", func(c *fakeCtr) { c.running = false })
+		var lk *state.Lock
+		h.docker.onInspect = func(string) {
+			h.docker.onInspect = nil
+			st := h.state()
+			st.Pending = &state.Intent{OpID: "dead", Op: "deploy", Phase: state.PhaseFlipping, From: st.Active,
+				To: state.Slot{Color: config.Green, Digest: digest(2)}}
+			if err := h.store.Save(st); err != nil {
+				t.Fatal(err)
+			}
+			if held {
+				var err error
+				if lk, err = h.store.LockService("web"); err != nil {
+					t.Fatal(err)
+				}
+			}
+		}
+		r, err := checkOne(t, h, false)
+		lk.Unlock()
+		if held {
+			if err != nil || r.Skipped == "" {
+				t.Fatalf("live flip during the probe should skip: %+v %v", r, err)
+			}
+			continue
+		}
+		if deploy.ExitCode(err) != deploy.CodeFailed || r.Kind != deploy.KindPending {
+			t.Fatalf("stale intent written during the probe must fail as %s: %+v %v", deploy.KindPending, r, err)
+		}
+	}
+}

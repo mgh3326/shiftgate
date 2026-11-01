@@ -40,6 +40,8 @@ type fakeDocker struct {
 	// restartErr fails Restart; restartKeepsHung leaves a hung container hung.
 	restartErr       error
 	restartKeepsHung bool
+	// onInspect, when set, runs (unlocked) before each Inspect answers.
+	onInspect func(name string)
 }
 
 type fakeCtr struct {
@@ -179,6 +181,9 @@ func (d *fakeDocker) Remove(ctx context.Context, name string) error {
 }
 
 func (d *fakeDocker) Inspect(ctx context.Context, name string) (docker.Container, bool, error) {
+	if d.onInspect != nil {
+		d.onInspect(name)
+	}
 	d.mu.Lock()
 	defer d.mu.Unlock()
 	c, ok := d.containers[name]
