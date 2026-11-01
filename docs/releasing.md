@@ -23,9 +23,9 @@ sh scripts/build-release.sh v0.0.0-dryrun.1 dist/release
 sh scripts/verify-release.sh v0.0.0-dryrun.1 dist/release
 ```
 
-A tag with a `-suffix` (`v1.2.3-rc.1`) builds the same way. Mark that release
-as a *pre-release* on GitHub, because hosts that follow `latest` skip
-pre-releases.
+A tag with a `-suffix` (`v1.2.3-rc.1`) builds the same way and is published
+as a *pre-release*. Hosts that follow `latest` skip pre-releases. Pin the tag
+on a host to try it there.
 
 ## How hosts get it
 

@@ -82,4 +82,9 @@ jobs:
         env:
           GH_TOKEN: ${{ github.token }}
           RELEASE_TAG: ${{ github.ref_name }}
-        run: gh release create "$RELEASE_TAG" dist/release/* --repo "$GITHUB_REPOSITORY" --verify-tag --generate-notes
+        # A -suffix tag (v1.2.3-rc.1) is a pre-release: never "Latest", so
+        # hosts that follow the latest release do not pick it up.
+        run: |
+          set --
+          case "$RELEASE_TAG" in *-*) set -- --prerelease ;; esac
+          gh release create "$RELEASE_TAG" dist/release/* --repo "$GITHUB_REPOSITORY" --verify-tag --generate-notes "$@"
