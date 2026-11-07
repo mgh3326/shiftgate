@@ -1,0 +1,261 @@
+name: Deploy
+
+# The deploy stage (operator decision 2026-11-07,
+# hk:doc decision/2026-11-07/fleet-ci-three-tiers-r2 §1, §4-2): race, the
+# macOS target, the release build of every artifact release.yml ships, and a
+# test-install smoke. It starts only from a successful main-stage run for that
+# run's head sha, is never cancelled, and posts the commit status deploy-ok as
+# candidate evidence. It deploys, publishes, tags and pushes nothing.
+#
+# This repository has no database and no schema, so there is no
+# deployed-schema -> candidate migration job here.
+#
+# The manual path (workflow_dispatch with ref) runs the same stage on any ref
+# and still posts deploy-ok on that ref's sha.
+on:
+  workflow_run:
+    workflows: ["Main"]
+    types: [completed]
+    branches: [main]
+  workflow_dispatch:
+    inputs:
+      ref:
+        description: 'Ref or sha to run the deploy stage on (empty = the dispatched ref)'
+        required: false
+        default: ''
+        type: string
+
+permissions:
+  contents: read
+  statuses: write
+
+concurrency:
+  # Never cancel a deploy: a cancelled run proves nothing and would leave a
+  # half-written verdict. One deploy per repository; GitHub keeps only the
+  # newest pending entry, so a newer head replaces an older queued one.
+  group: deploy-${{ github.repository }}
+  cancel-in-progress: false
+
+jobs:
+  candidate:
+    # Only a successful main-stage run for its own head sha, or the manual
+    # ref path.
+    if: ${{ github.event_name == 'workflow_dispatch' || github.event.workflow_run.conclusion == 'success' }}
+    runs-on: ubuntu-latest
+    outputs:
+      sha: ${{ steps.sha.outputs.sha }}
+      policy_revision: ${{ steps.policy.outputs.revision }}
+    steps:
+      - name: Choose the ref to check
+        id: ref
+        env:
+          INPUT_REF: ${{ inputs.ref }}
+          RUN_SHA: ${{ github.event.workflow_run.head_sha }}
+          EVENT: ${{ github.event_name }}
+        run: |
+          if [ "$EVENT" = workflow_run ]; then
+            ref="$RUN_SHA"
+          else
+            ref="${INPUT_REF:-$GITHUB_SHA}"
+          fi
+          if [ -z "$ref" ]; then
+            echo "deploy: no ref to check (event $EVENT)" >&2
+            exit 1
+          fi
+          echo "ref=$ref" >> "$GITHUB_OUTPUT"
+      - uses: actions/checkout@v4
+        with:
+          ref: ${{ steps.ref.outputs.ref }}
+          fetch-depth: 0
+      - name: Resolve the candidate sha
+        id: sha
+        run: echo "sha=$(git rev-parse HEAD)" >> "$GITHUB_OUTPUT"
+      - name: Read the policy revision
+        id: policy
+        run: |
+          revision=$(git log -1 --format=%H -- .mergewake/policy.yaml)
+          if [ -z "$revision" ]; then
+            echo "deploy: .mergewake/policy.yaml has no commit in this history" >&2
+            exit 1
+          fi
+          echo "revision=$revision" >> "$GITHUB_OUTPUT"
+
+  race:
+    needs: candidate
+    runs-on: ubuntu-latest
+    env:
+      # Fail instead of skipping when a dependency is missing.
+      SHIFTGATE_REQUIRE_HAPROXY: '1'
+      SHIFTGATE_REQUIRE_DOCKER: '1'
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          ref: ${{ needs.candidate.outputs.sha }}
+      - uses: actions/setup-go@v5
+        with:
+          go-version: '1.27.x'
+          cache: true
+      - name: Install HAProxy
+        run: |
+          sudo apt-get update -qq
+          sudo apt-get install -y -qq haproxy
+          sudo systemctl stop haproxy || true
+          haproxy -v
+      - run: docker version --format '{{.Server.Version}}'
+      # The full suite is green under -race today; no test is excluded here.
+      - run: go test -race -v ./...
+
+  macos:
+    needs: candidate
+    runs-on: macos-latest
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          ref: ${{ needs.candidate.outputs.sha }}
+      - uses: actions/setup-go@v5
+        with:
+          go-version: '1.27.x'
+          cache: true
+      - name: gofmt
+        run: |
+          unformatted=$(gofmt -l .)
+          if [ -n "$unformatted" ]; then
+            echo "gofmt needed on:"; echo "$unformatted"
+            exit 1
+          fi
+      - run: go vet ./...
+      - run: go build ./...
+      # Docker and HAProxy tests skip on macOS (SHIFTGATE_REQUIRE_* is unset);
+      # the release ships darwin binaries, so this is the platform check.
+      - run: go test ./...
+      - name: Build both darwin binaries
+        run: |
+          for arch in amd64 arm64; do
+            CGO_ENABLED=0 GOOS=darwin GOARCH=$arch go build -trimpath \
+              -ldflags='-s -w' -o "dist/shiftgate-darwin-$arch" ./cmd/shiftgate
+          done
+      - name: Smoke the native binary
+        run: |
+          native="dist/shiftgate-darwin-$(go env GOHOSTARCH)"
+          "$native" version
+
+  release:
+    needs: candidate
+    runs-on: ubuntu-latest
+    outputs:
+      digest: ${{ steps.digest.outputs.digest }}
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          ref: ${{ needs.candidate.outputs.sha }}
+      - uses: actions/setup-go@v5
+        with:
+          go-version: '1.27.x'
+          cache: true
+      - name: Build every release artifact
+        env:
+          TAG: v0.0.0-ci.${{ github.run_id }}
+        run: sh scripts/build-release.sh "$TAG" dist/release
+      - name: Verify assets, SHA256SUMS and version output
+        env:
+          TAG: v0.0.0-ci.${{ github.run_id }}
+        run: |
+          sh scripts/verify-release.sh "$TAG" dist/release
+          cat dist/release/SHA256SUMS
+      - name: Digest the artifact set
+        id: digest
+        run: echo "digest=$(sha256sum dist/release/SHA256SUMS | cut -d' ' -f1)" >> "$GITHUB_OUTPUT"
+      - uses: actions/upload-artifact@v4
+        with:
+          name: deploy-release-assets
+          path: dist/release/
+          if-no-files-found: error
+          retention-days: 7
+
+  install-smoke:
+    needs: [candidate, release]
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/download-artifact@v4
+        with:
+          name: deploy-release-assets
+          path: dist/release
+      - name: Install the linux binary into a prefix and run it
+        env:
+          TAG: v0.0.0-ci.${{ github.run_id }}
+        run: |
+          prefix="$RUNNER_TEMP/prefix"
+          install -D -m 0755 dist/release/shiftgate-linux-amd64 "$prefix/bin/shiftgate"
+          (cd dist/release && sha256sum -c SHA256SUMS)
+          out=$("$prefix/bin/shiftgate" version)
+          echo "$out"
+          printf '%s\n' "$out" | tr -s ' \t()=,' '\n' | grep -Fxq -- "$TAG"
+          set +e
+          usage=$("$prefix/bin/shiftgate" 2>&1)
+          code=$?
+          set -e
+          test "$code" -eq 2
+          printf '%s\n' "$usage" | grep -q '^usage: shiftgate '
+
+  deploy-ok:
+    name: deploy-ok
+    needs: [candidate, race, macos, release, install-smoke]
+    # A failed main-stage run never reaches here (candidate is skipped), and a
+    # real attempt always posts its verdict, including a failure.
+    if: ${{ always() && needs.candidate.result != 'skipped' }}
+    runs-on: ubuntu-latest
+    steps:
+      - name: Post deploy-ok commit status with candidate evidence
+        env:
+          GH_TOKEN: ${{ github.token }}
+          REPO: ${{ github.repository }}
+          TARGET_SHA: ${{ needs.candidate.outputs.sha || github.event.workflow_run.head_sha || github.sha }}
+          POLICY_REVISION: ${{ needs.candidate.outputs.policy_revision }}
+          ARTIFACT_DIGEST: ${{ needs.release.outputs.digest }}
+          RUN_ID: ${{ github.run_id }}
+          RUN_URL: ${{ github.server_url }}/${{ github.repository }}/actions/runs/${{ github.run_id }}
+          RACE_RESULT: ${{ needs.race.result }}
+          MACOS_RESULT: ${{ needs.macos.result }}
+          RELEASE_RESULT: ${{ needs.release.result }}
+          SMOKE_RESULT: ${{ needs.install-smoke.result }}
+        shell: bash
+        run: |
+          state=success result=success
+          for r in "$RACE_RESULT" "$MACOS_RESULT" "$RELEASE_RESULT" "$SMOKE_RESULT"; do
+            case "$r" in
+              success) ;;
+              cancelled) [ "$state" = failure ] || state=error ;;
+              *) state=failure ;;
+            esac
+          done
+          if [ "$state" = error ]; then result=cancelled
+          elif [ "$state" = failure ]; then result=failure
+          fi
+          if [ -z "$ARTIFACT_DIGEST" ]; then ARTIFACT_DIGEST=none; fi
+          description="repo=$REPO sha=${TARGET_SHA:0:12} policy=${POLICY_REVISION:0:12} suite=deploy env=ci run=$RUN_ID $result digest=${ARTIFACT_DIGEST:0:16}"
+          if [ "${#description}" -gt 140 ]; then
+            echo "deploy-ok description is ${#description} characters, over the 140 limit" >&2; exit 1
+          fi
+          {
+            echo "## deploy-ok candidate evidence"
+            echo
+            echo "| field | value |"
+            echo "|---|---|"
+            echo "| repo | \`$REPO\` |"
+            echo "| sha | \`$TARGET_SHA\` |"
+            echo "| policy_revision | \`$POLICY_REVISION\` |"
+            echo "| suite | deploy |"
+            echo "| environment | ci |"
+            echo "| run_id | \`$RUN_ID\` |"
+            echo "| race | $RACE_RESULT |"
+            echo "| macos | $MACOS_RESULT |"
+            echo "| release | $RELEASE_RESULT |"
+            echo "| install-smoke | $SMOKE_RESULT |"
+            echo "| result | $result |"
+            echo "| artifact digest | \`$ARTIFACT_DIGEST\` |"
+          } >> "$GITHUB_STEP_SUMMARY"
+          gh api "repos/${REPO}/statuses/${TARGET_SHA}" \
+            -f state="$state" \
+            -f context=deploy-ok \
+            -f target_url="$RUN_URL" \
+            -f description="$description"

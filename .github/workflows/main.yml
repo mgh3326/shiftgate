@@ -1,0 +1,137 @@
+name: Main
+
+# The main stage (operator decision 2026-11-07,
+# hk:doc decision/2026-11-07/fleet-ci-three-tiers-r2 §1, §4-2): every basic
+# check the pull-request stage runs, without -race, on each push to main. It
+# stays under ten minutes; race, the macOS target, the release artifacts and
+# the install smoke are the deploy stage (deploy.yml), which starts from this
+# workflow's success for the same sha. The aggregation job below posts the
+# commit status ci-ok on that sha.
+#
+# This repository has no database, no schema migration and no regression
+# mutants, so the main stage carries no DB or mutant job.
+on:
+  push:
+    branches: [main]
+  workflow_dispatch:
+
+permissions:
+  contents: read
+  statuses: write
+
+concurrency:
+  # A newer main head cancels an older run: only the newest head matters.
+  group: main-${{ github.repository }}
+  cancel-in-progress: true
+
+jobs:
+  vet:
+    name: vet
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-go@v5
+        with:
+          go-version: '1.27.x'
+          cache: true
+      - run: test -z "$(gofmt -l .)" || { gofmt -l .; exit 1; }
+      - run: go vet ./...
+
+  test:
+    name: test (haproxy + docker, no race)
+    runs-on: ubuntu-latest
+    env:
+      # Fail instead of skipping when a dependency is missing.
+      SHIFTGATE_REQUIRE_HAPROXY: '1'
+      SHIFTGATE_REQUIRE_DOCKER: '1'
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-go@v5
+        with:
+          go-version: '1.27.x'
+          cache: true
+      - name: Install HAProxy
+        run: |
+          sudo apt-get update -qq
+          sudo apt-get install -y -qq haproxy
+          sudo systemctl stop haproxy || true
+          haproxy -v
+      - run: docker version --format '{{.Server.Version}}'
+      # No -race here: the race suite is the deploy stage (deploy.yml).
+      - run: go test -v ./...
+
+  build:
+    name: build-${{ matrix.goos }}-${{ matrix.goarch }}
+    runs-on: ubuntu-latest
+    strategy:
+      fail-fast: false
+      matrix:
+        goos: [linux, darwin]
+        goarch: [amd64, arm64]
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-go@v5
+        with:
+          go-version: '1.27.x'
+          cache: true
+      - run: go build -trimpath -ldflags='-s -w' -o dist/shiftgate-${{ matrix.goos }}-${{ matrix.goarch }} ./cmd/shiftgate
+        env:
+          CGO_ENABLED: '0'
+          GOOS: ${{ matrix.goos }}
+          GOARCH: ${{ matrix.goarch }}
+
+  ci-ok:
+    name: ci-ok
+    needs: [vet, test, build]
+    # The verdict is always posted, including on a failure, so a head is never
+    # left looking green by a missing status.
+    if: ${{ always() }}
+    runs-on: ubuntu-latest
+    steps:
+      - name: Post ci-ok commit status
+        env:
+          GH_TOKEN: ${{ github.token }}
+          REPO: ${{ github.repository }}
+          TARGET_SHA: ${{ github.sha }}
+          RUN_ID: ${{ github.run_id }}
+          RUN_URL: ${{ github.server_url }}/${{ github.repository }}/actions/runs/${{ github.run_id }}
+          VET_RESULT: ${{ needs.vet.result }}
+          TEST_RESULT: ${{ needs.test.result }}
+          BUILD_RESULT: ${{ needs.build.result }}
+        shell: bash
+        run: |
+          state=success result=success
+          for r in "$VET_RESULT" "$TEST_RESULT" "$BUILD_RESULT"; do
+            case "$r" in
+              success) ;;
+              cancelled) [ "$state" = failure ] || state=error ;;
+              *) state=failure ;;
+            esac
+          done
+          if [ "$state" = error ]; then result=cancelled
+          elif [ "$state" = failure ]; then result=failure
+          fi
+          description="repo=$REPO sha=${TARGET_SHA:0:12} suite=main env=ci run=$RUN_ID $result"
+          if [ "${#description}" -gt 140 ]; then
+            echo "ci-ok description is ${#description} characters, over the 140 limit" >&2; exit 1
+          fi
+          {
+            echo "## ci-ok evidence"
+            echo
+            echo "| field | value |"
+            echo "|---|---|"
+            echo "| repo | \`$REPO\` |"
+            echo "| sha | \`$TARGET_SHA\` |"
+            echo "| suite | main |"
+            echo "| environment | ci |"
+            echo "| run_id | \`$RUN_ID\` |"
+            echo "| vet | $VET_RESULT |"
+            echo "| test | $TEST_RESULT |"
+            echo "| build | $BUILD_RESULT |"
+            echo "| result | $result |"
+          } >> "$GITHUB_STEP_SUMMARY"
+          gh api "repos/${REPO}/statuses/${TARGET_SHA}" \
+            -f state="$state" \
+            -f context=ci-ok \
+            -f target_url="$RUN_URL" \
+            -f description="$description"

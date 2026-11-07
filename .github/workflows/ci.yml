@@ -1,7 +1,11 @@
 name: CI
+
+# The pull-request stage, unchanged, and still the merge condition. A push to
+# main runs the main stage (main.yml, no -race, posts ci-ok) and then the
+# deploy stage (deploy.yml, race, macOS, release artifacts, install smoke);
+# operator decision 2026-11-07,
+# hk:doc decision/2026-11-07/fleet-ci-three-tiers-r2 §1, §4-2.
 on:
-  push:
-    branches: [main]
   pull_request:
 permissions:
   contents: read
