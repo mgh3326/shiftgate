@@ -53,6 +53,7 @@ jobs:
     outputs:
       sha: ${{ steps.sha.outputs.sha }}
       policy_revision: ${{ steps.policy.outputs.revision }}
+      policy_commit: ${{ steps.policy.outputs.commit }}
     steps:
       - name: Choose the ref to check
         id: ref
@@ -81,12 +82,14 @@ jobs:
       - name: Read the policy revision
         id: policy
         run: |
-          revision=$(git log -1 --format=%H -- .mergewake/policy.yaml)
-          if [ -z "$revision" ]; then
-            echo "deploy: .mergewake/policy.yaml has no commit in this history" >&2
+          revision=$(git rev-parse HEAD:.mergewake/policy.yaml)
+          commit=$(git log -1 --format=%H -- .mergewake/policy.yaml)
+          if [ -z "$revision" ] || [ -z "$commit" ]; then
+            echo "deploy: cannot identify .mergewake/policy.yaml" >&2
             exit 1
           fi
           echo "revision=$revision" >> "$GITHUB_OUTPUT"
+          echo "commit=$commit" >> "$GITHUB_OUTPUT"
 
   race:
     needs: candidate
@@ -219,6 +222,7 @@ jobs:
           REPO: ${{ github.repository }}
           TARGET_SHA: ${{ needs.candidate.outputs.sha || github.event.workflow_run.head_sha || github.sha }}
           POLICY_REVISION: ${{ needs.candidate.outputs.policy_revision }}
+          POLICY_COMMIT: ${{ needs.candidate.outputs.policy_commit }}
           ARTIFACT_DIGEST: ${{ needs.release.outputs.digest }}
           RUN_ID: ${{ github.run_id }}
           RUN_URL: ${{ github.server_url }}/${{ github.repository }}/actions/runs/${{ github.run_id }}
@@ -251,7 +255,8 @@ jobs:
             echo "|---|---|"
             echo "| repo | \`$REPO\` |"
             echo "| sha | \`$TARGET_SHA\` |"
-            echo "| policy_revision | \`$POLICY_REVISION\` |"
+            echo "| policy_revision | \`$POLICY_REVISION\` (blob sha of .mergewake/policy.yaml) |"
+            echo "| policy_commit | \`$POLICY_COMMIT\` |"
             echo "| suite | deploy |"
             echo "| environment | ci |"
             echo "| run_id | \`$RUN_ID\` |"
