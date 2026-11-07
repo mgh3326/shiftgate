@@ -17,9 +17,10 @@ on:
   # The manual ref path calls this stage (ci.yml workflow_dispatch suite=main).
   workflow_call:
 
+# Only the verdict job writes commit statuses; candidate code never sees that
+# token (checkouts also keep no credentials).
 permissions:
   contents: read
-  statuses: write
 
 concurrency:
   # A newer main head cancels an older run: only the newest head matters.
@@ -32,6 +33,8 @@ jobs:
     runs-on: ubuntu-latest
     steps:
       - uses: actions/checkout@v4
+        with:
+          persist-credentials: false
       - uses: actions/setup-go@v5
         with:
           go-version: '1.27.x'
@@ -48,6 +51,8 @@ jobs:
       SHIFTGATE_REQUIRE_DOCKER: '1'
     steps:
       - uses: actions/checkout@v4
+        with:
+          persist-credentials: false
       - uses: actions/setup-go@v5
         with:
           go-version: '1.27.x'
@@ -60,7 +65,7 @@ jobs:
           haproxy -v
       - run: docker version --format '{{.Server.Version}}'
       # No -race here: the race suite is the deploy stage (deploy.yml).
-      - run: go test -v ./...
+      - run: go test -count=1 -v ./...
 
   build:
     name: build-${{ matrix.goos }}-${{ matrix.goarch }}
@@ -72,6 +77,8 @@ jobs:
         goarch: [amd64, arm64]
     steps:
       - uses: actions/checkout@v4
+        with:
+          persist-credentials: false
       - uses: actions/setup-go@v5
         with:
           go-version: '1.27.x'
@@ -84,6 +91,9 @@ jobs:
 
   ci-ok:
     name: ci-ok
+    permissions:
+      contents: read
+      statuses: write
     needs: [vet, test, build]
     # The verdict is always posted, including on a failure, so a head is never
     # left looking green by a missing status.
@@ -114,9 +124,10 @@ jobs:
           elif [ "$state" = failure ]; then result=failure
           fi
           description="repo=$REPO sha=${TARGET_SHA:0:12} suite=main env=ci run=$RUN_ID $result"
-          if [ "${#description}" -gt 140 ]; then
-            echo "ci-ok description is ${#description} characters, over the 140 limit" >&2; exit 1
-          fi
+          # GitHub caps a status description at 140 characters; the full evidence
+          # is in the job summary, so a long repository name shortens the line
+          # instead of dropping the verdict.
+          description=${description:0:140}
           {
             echo "## ci-ok evidence"
             echo

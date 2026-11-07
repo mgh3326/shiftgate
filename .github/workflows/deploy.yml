@@ -33,9 +33,10 @@ on:
         default: ''
         type: string
 
+# Only the verdict job writes commit statuses; candidate code never sees that
+# token (checkouts also keep no credentials).
 permissions:
   contents: read
-  statuses: write
 
 concurrency:
   # Never cancel a deploy: a cancelled run proves nothing and would leave a
@@ -74,6 +75,7 @@ jobs:
           echo "ref=$ref" >> "$GITHUB_OUTPUT"
       - uses: actions/checkout@v4
         with:
+          persist-credentials: false
           ref: ${{ steps.ref.outputs.ref }}
           fetch-depth: 0
       - name: Resolve the candidate sha
@@ -101,6 +103,7 @@ jobs:
     steps:
       - uses: actions/checkout@v4
         with:
+          persist-credentials: false
           ref: ${{ needs.candidate.outputs.sha }}
       - uses: actions/setup-go@v5
         with:
@@ -122,6 +125,7 @@ jobs:
     steps:
       - uses: actions/checkout@v4
         with:
+          persist-credentials: false
           ref: ${{ needs.candidate.outputs.sha }}
       - uses: actions/setup-go@v5
         with:
@@ -158,6 +162,7 @@ jobs:
     steps:
       - uses: actions/checkout@v4
         with:
+          persist-credentials: false
           ref: ${{ needs.candidate.outputs.sha }}
       - uses: actions/setup-go@v5
         with:
@@ -210,6 +215,9 @@ jobs:
 
   deploy-ok:
     name: deploy-ok
+    permissions:
+      contents: read
+      statuses: write
     needs: [candidate, race, macos, release, install-smoke]
     # A failed main-stage run never reaches here (candidate is skipped), and a
     # real attempt always posts its verdict, including a failure.
@@ -245,9 +253,10 @@ jobs:
           fi
           if [ -z "$ARTIFACT_DIGEST" ]; then ARTIFACT_DIGEST=none; fi
           description="repo=$REPO sha=${TARGET_SHA:0:12} policy=${POLICY_REVISION:0:12} suite=deploy env=ci run=$RUN_ID $result digest=${ARTIFACT_DIGEST:0:16}"
-          if [ "${#description}" -gt 140 ]; then
-            echo "deploy-ok description is ${#description} characters, over the 140 limit" >&2; exit 1
-          fi
+          # GitHub caps a status description at 140 characters; the full evidence
+          # is in the job summary, so a long repository name shortens the line
+          # instead of dropping the verdict.
+          description=${description:0:140}
           {
             echo "## deploy-ok candidate evidence"
             echo
