@@ -14,6 +14,8 @@ on:
   push:
     branches: [main]
   workflow_dispatch:
+  # The manual ref path calls this stage (ci.yml workflow_dispatch suite=main).
+  workflow_call:
 
 permissions:
   contents: read

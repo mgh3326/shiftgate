@@ -5,12 +5,29 @@ name: CI
 # deploy stage (deploy.yml, race, macOS, release artifacts, install smoke);
 # operator decision 2026-11-07,
 # hk:doc decision/2026-11-07/fleet-ci-three-tiers-r2 §1, §4-2.
+#
+# workflow_dispatch runs one stage on any ref. This file already exists on the
+# default branch, so it can be dispatched from a branch; main.yml and
+# deploy.yml cannot (GitHub requires the file on the default branch for
+# workflow_dispatch), so this is the manual ref path -- the equivalent of
+# ci-any-ref.yml suite=deploy where a repository has one. It runs one stage and
+# nothing else, so its duration is that stage's.
 on:
   pull_request:
+  workflow_dispatch:
+    inputs:
+      suite:
+        description: 'Stage to run on this ref'
+        required: true
+        type: choice
+        options:
+          - main
+          - deploy
 permissions:
   contents: read
 jobs:
   vet:
+    if: ${{ github.event_name == 'pull_request' }}
     name: vet
     runs-on: ubuntu-latest
     steps:
@@ -22,6 +39,7 @@ jobs:
       - run: test -z "$(gofmt -l .)" || { gofmt -l .; exit 1; }
       - run: go vet ./...
   test:
+    if: ${{ github.event_name == 'pull_request' }}
     name: test (haproxy + docker)
     runs-on: ubuntu-latest
     env:
@@ -43,6 +61,7 @@ jobs:
       - run: docker version --format '{{.Server.Version}}'
       - run: go test -race -v ./...
   build:
+    if: ${{ github.event_name == 'pull_request' }}
     name: build-${{ matrix.goos }}-${{ matrix.goarch }}
     runs-on: ubuntu-latest
     strategy:
@@ -61,3 +80,23 @@ jobs:
           CGO_ENABLED: '0'
           GOOS: ${{ matrix.goos }}
           GOARCH: ${{ matrix.goarch }}
+
+  main-stage:
+    # The manual ref path for the main stage. A local reusable workflow is read
+    # from this commit, so it runs on a branch even before it is on main.
+    if: ${{ github.event_name == 'workflow_dispatch' && inputs.suite == 'main' }}
+    permissions:
+      contents: read
+      statuses: write
+    uses: ./.github/workflows/main.yml
+
+  deploy-stage:
+    # The manual ref path for the deploy stage (r2 §4-2): the same stage, on
+    # the dispatched ref's sha, posting deploy-ok there.
+    if: ${{ github.event_name == 'workflow_dispatch' && inputs.suite == 'deploy' }}
+    permissions:
+      contents: read
+      statuses: write
+    uses: ./.github/workflows/deploy.yml
+    with:
+      ref: ${{ github.sha }}

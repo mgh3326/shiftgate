@@ -24,6 +24,14 @@ on:
         required: false
         default: ''
         type: string
+  # The manual ref path calls this stage (ci.yml workflow_dispatch suite=deploy).
+  workflow_call:
+    inputs:
+      ref:
+        description: 'Ref or sha to run the deploy stage on (empty = the caller ref)'
+        required: false
+        default: ''
+        type: string
 
 permissions:
   contents: read
@@ -40,7 +48,7 @@ jobs:
   candidate:
     # Only a successful main-stage run for its own head sha, or the manual
     # ref path.
-    if: ${{ github.event_name == 'workflow_dispatch' || github.event.workflow_run.conclusion == 'success' }}
+    if: ${{ github.event_name == 'workflow_dispatch' || github.event_name == 'workflow_call' || github.event.workflow_run.conclusion == 'success' }}
     runs-on: ubuntu-latest
     outputs:
       sha: ${{ steps.sha.outputs.sha }}
