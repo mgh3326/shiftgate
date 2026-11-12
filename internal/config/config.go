@@ -88,8 +88,9 @@ const (
 // colour starts (for example database migrations).
 type PreDeploy struct {
 	// Args replace the image's CMD; its ENTRYPOINT is kept.
-	Args    []string `yaml:"args"`
-	Timeout Duration `yaml:"timeout"`
+	Args     []string `yaml:"args"`
+	Timeout  Duration `yaml:"timeout"`
+	EnvFiles []string `yaml:"env_files"`
 }
 
 // HAProxy describes the one shared HAProxy instance on this host.
@@ -518,6 +519,13 @@ func (f *File) validate() error {
 		for _, e := range s.EnvFiles {
 			if !strings.HasPrefix(e, "/") {
 				bad("%s: env_files must be absolute paths", where)
+			}
+		}
+		if s.PreDeploy != nil {
+			for _, e := range s.PreDeploy.EnvFiles {
+				if !strings.HasPrefix(e, "/") {
+					bad("%s: pre_deploy.env_files must be absolute paths", where)
+				}
 			}
 		}
 		for k := range s.Env {

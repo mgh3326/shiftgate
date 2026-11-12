@@ -59,8 +59,9 @@ func TestRejects(t *testing.T) {
 		"log on static upstream": {`health: {http: /healthz}`, "health: {http: /healthz}\n  - name: legacy\n    binds: [\"127.0.0.1:9000\"]\n    upstream: 127.0.0.1:9001\n    health: {tcp: true}\n    log: {max_file: -1}", "cannot set pre_deploy, registry_auth_file or log"},
 		"bad log driver":         {`haproxy:`, "log: {driver: journald}\nhaproxy:", "log.driver"},
 		"log-opt in run_args":    {`health: {http: /healthz}`, "health: {http: /healthz}\n    run_args: [\"--log-opt=max-size=1g\"]", "may not set --log-opt"},
-		"empty pre_deploy":       {`health: {http: /healthz}`, "health: {http: /healthz}\n    pre_deploy: {timeout: 1m}", "pre_deploy.args"},
-		"relative registry auth": {`health: {http: /healthz}`, "health: {http: /healthz}\n    registry_auth_file: reg.env", "registry_auth_file"},
+		"empty pre_deploy":             {`health: {http: /healthz}`, "health: {http: /healthz}\n    pre_deploy: {timeout: 1m}", "pre_deploy.args"},
+		"relative pre_deploy env file": {`health: {http: /healthz}`, "health: {http: /healthz}\n    pre_deploy: {args: [migrate], env_files: [rel.env]}", "pre_deploy.env_files must be absolute paths"},
+		"relative registry auth":       {`health: {http: /healthz}`, "health: {http: /healthz}\n    registry_auth_file: reg.env", "registry_auth_file"},
 	}
 	for name, c := range cases {
 		t.Run(name, func(t *testing.T) {
@@ -124,5 +125,25 @@ func TestLogDriverDaemonAllowsRunArgs(t *testing.T) {
 		"health: {http: /healthz}\n    log: {driver: daemon}\n    run_args: [\"--log-driver=journald\"]", 1)))
 	if err != nil || f.Services[0].Log.Driver != config.LogDaemon || f.Log.Driver != config.LogJSONFile {
 		t.Fatalf("%v %+v", err, f)
+	}
+}
+
+func TestPreDeployEnvFilesValidation(t *testing.T) {
+	// (a) config with relative pre_deploy.env_files path -> validation error
+	_, err := config.Parse([]byte(strings.Replace(base, "health: {http: /healthz}",
+		"health: {http: /healthz}\n    pre_deploy: {args: [migrate], env_files: [migration.env]}", 1)))
+	if err == nil || !strings.Contains(err.Error(), "pre_deploy.env_files must be absolute paths") {
+		t.Fatalf("want relative pre_deploy.env_files error, got: %v", err)
+	}
+
+	// Valid absolute path parses successfully
+	cfg, err := config.Parse([]byte(strings.Replace(base, "health: {http: /healthz}",
+		"health: {http: /healthz}\n    pre_deploy: {args: [migrate], env_files: [/etc/shiftgate/migration.env]}", 1)))
+	if err != nil {
+		t.Fatalf("unexpected error parsing valid pre_deploy.env_files: %v", err)
+	}
+	s := cfg.Services[0]
+	if s.PreDeploy == nil || len(s.PreDeploy.EnvFiles) != 1 || s.PreDeploy.EnvFiles[0] != "/etc/shiftgate/migration.env" {
+		t.Fatalf("parsed pre_deploy.env_files mismatch: %+v", s.PreDeploy)
 	}
 }

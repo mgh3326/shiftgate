@@ -475,3 +475,67 @@ func setCommands(cmds []string) []string {
 	}
 	return out
 }
+
+func TestPreDeployEnvFilesSpec(t *testing.T) {
+	svc := &config.Service{
+		Name:          "web",
+		Image:         "ghcr.io/example/web",
+		ContainerPort: 8080,
+		Ports:         config.Ports{Blue: 18080, Green: 18081},
+		EnvFiles:      []string{"/etc/web/common.env", "/etc/web/base.env"},
+		PreDeploy: &config.PreDeploy{
+			Args:     []string{"alembic", "upgrade", "head"},
+			EnvFiles: []string{"/etc/web/migration.env", "/etc/web/override.env"},
+		},
+	}
+
+	t.Run("b_pre_deploy_spec_env_files_order", func(t *testing.T) {
+		// (b) pre_deploy spec env files = colour files + pre_deploy files in that order
+		spec := deploy.PreDeploySpec(svc, config.Blue, "sha256:1111111111111111111111111111111111111111111111111111111111111111")
+		want := []string{
+			"/etc/web/common.env",
+			"/etc/web/base.env",
+			"/etc/web/migration.env",
+			"/etc/web/override.env",
+		}
+		if !slices.Equal(spec.EnvFiles, want) {
+			t.Fatalf("PreDeploySpec EnvFiles = %v, want %v", spec.EnvFiles, want)
+		}
+	})
+
+	t.Run("c_colour_container_spec_has_no_pre_deploy_files", func(t *testing.T) {
+		// (c) colour container spec has no pre_deploy files
+		colourSpec := deploy.RunSpec(svc, config.Blue, "sha256:1111111111111111111111111111111111111111111111111111111111111111")
+		want := []string{"/etc/web/common.env", "/etc/web/base.env"}
+		if !slices.Equal(colourSpec.EnvFiles, want) {
+			t.Fatalf("RunSpec EnvFiles = %v, want %v", colourSpec.EnvFiles, want)
+		}
+		for _, pdFile := range svc.PreDeploy.EnvFiles {
+			if slices.Contains(colourSpec.EnvFiles, pdFile) {
+				t.Fatalf("RunSpec EnvFiles should not contain pre_deploy env file %q", pdFile)
+			}
+		}
+	})
+
+	t.Run("d_config_without_the_key_identical_to_base", func(t *testing.T) {
+		// (d) config without the key → pre_deploy spec identical to base
+		svcNoKey := &config.Service{
+			Name:          "web",
+			Image:         "ghcr.io/example/web",
+			ContainerPort: 8080,
+			Ports:         config.Ports{Blue: 18080, Green: 18081},
+			EnvFiles:      []string{"/etc/web/common.env", "/etc/web/base.env"},
+			PreDeploy: &config.PreDeploy{
+				Args: []string{"alembic", "upgrade", "head"},
+			},
+		}
+		spec := deploy.PreDeploySpec(svcNoKey, config.Blue, "sha256:1111111111111111111111111111111111111111111111111111111111111111")
+		colourSpec := deploy.RunSpec(svcNoKey, config.Blue, "sha256:1111111111111111111111111111111111111111111111111111111111111111")
+		if !slices.Equal(spec.EnvFiles, colourSpec.EnvFiles) {
+			t.Fatalf("PreDeploySpec EnvFiles = %v without key, want identical to colour EnvFiles %v", spec.EnvFiles, colourSpec.EnvFiles)
+		}
+		if !slices.Equal(spec.EnvFiles, svcNoKey.EnvFiles) {
+			t.Fatalf("PreDeploySpec EnvFiles = %v, want %v", spec.EnvFiles, svcNoKey.EnvFiles)
+		}
+	})
+}
