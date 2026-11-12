@@ -400,7 +400,7 @@ func (g *Gate) abort(ss *session, result string, cause error, stopTarget bool) e
 		}
 	}
 	cur.Pending = nil
-	cur.LastOp, cur.LastResult, cur.LastError = op.Op, result, cause.Error()
+	cur.LastOp, cur.LastOpID, cur.LastResult, cur.LastError = op.Op, op.OpID, result, cause.Error()
 	ss.aborted, ss.abortedOp = result, op.OpID
 	if err := g.Store.Save(cur); err != nil {
 		return fail(CodeRecovery, "%s: %v; and clearing the intent failed: %v", result, cause, err)
@@ -509,7 +509,7 @@ func (g *Gate) commit(ctx context.Context, ss *session) (*Result, error) {
 	cur.PushHistory(to.Digest)
 	cur.Generation++
 	cur.LastSwapAt = g.now()
-	cur.LastOp, cur.LastResult, cur.LastError = op.Op, "ok", ""
+	cur.LastOp, cur.LastOpID, cur.LastResult, cur.LastError = op.Op, op.OpID, "ok", ""
 	switch {
 	case op.Op == "rollback" && op.From != nil:
 		// follow must not bring back the digest that was just rolled back.
@@ -546,7 +546,13 @@ func (g *Gate) drainAndStop(ctx context.Context, svc *config.Service, old config
 	be := svc.Backend
 	deadline := time.Now().Add(svc.DrainTimeout.D())
 	for {
+		if ctx.Err() != nil {
+			return append(warns, fmt.Sprintf("drain of %s canceled", old))
+		}
 		n, err := g.Router.Sessions(ctx, be, string(old))
+		if ctx.Err() != nil {
+			return append(warns, fmt.Sprintf("drain of %s canceled", old))
+		}
 		if err == nil && n == 0 {
 			break
 		}
@@ -558,7 +564,11 @@ func (g *Gate) drainAndStop(ctx context.Context, svc *config.Service, old config
 			}
 			break
 		}
-		time.Sleep(g.poll())
+		select {
+		case <-ctx.Done():
+			return append(warns, fmt.Sprintf("drain of %s canceled", old))
+		case <-time.After(g.poll()):
+		}
 	}
 	if err := g.Router.SetState(ctx, be, string(old), "maint"); err != nil {
 		warns = append(warns, fmt.Sprintf("set %s maint: %v", old, err))

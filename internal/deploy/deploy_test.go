@@ -3,6 +3,7 @@ package deploy_test
 import (
 	"context"
 	"errors"
+	"fmt"
 	"os"
 	"slices"
 	"strings"
@@ -464,6 +465,184 @@ func TestRenderRefusedWhilePending(t *testing.T) {
 		t.Fatalf("render with pending flip: %v", err)
 	}
 	h.noReload()
+}
+
+func TestDeployCommittedAndFailedRecordLastOpID(t *testing.T) {
+	h := newHarness(t)
+	res, err := h.gate.Deploy(context.Background(), "web", digest(1))
+	if err != nil {
+		t.Fatal(err)
+	}
+	st := h.state()
+	if st.LastOpID == "" || st.LastOpID != res.OpID {
+		t.Fatalf("committed deploy: want LastOpID %q, got %q", res.OpID, st.LastOpID)
+	}
+	if st.LastOp != "deploy" || st.LastResult != "ok" {
+		t.Fatalf("committed deploy state: %+v", st)
+	}
+	// status --json exposes state.last_op_id
+	stat := h.gate.Status(context.Background())[0]
+	if stat.State == nil || stat.State.LastOpID != res.OpID {
+		t.Fatalf("status state.last_op_id = %v, want %q", stat.State, res.OpID)
+	}
+	committedOpID := res.OpID
+
+	// Failed deploy also records its op_id in LastOpID
+	h.health.markBad(digest(2))
+	_, err = h.gate.Deploy(context.Background(), "web", digest(2))
+	if err == nil || deploy.ExitCode(err) != deploy.CodeFailed {
+		t.Fatalf("want exit %d, got %v", deploy.CodeFailed, err)
+	}
+	st = h.state()
+	swaps := h.swaps()
+	lastSwap := swaps[len(swaps)-1]
+	if st.LastOpID == "" || !strings.Contains(lastSwap, fmt.Sprintf(`"op_id":%q`, st.LastOpID)) {
+		t.Fatalf("failed deploy LastOpID %q not in swap log: %s", st.LastOpID, lastSwap)
+	}
+	if st.LastOpID == committedOpID {
+		t.Fatalf("failed deploy LastOpID must differ from previous committed op_id")
+	}
+	if st.LastOp != "deploy" || st.LastResult != "unhealthy" {
+		t.Fatalf("failed deploy state: %+v", st)
+	}
+}
+
+func TestDeployLoadsOldStateWithoutLastOpID(t *testing.T) {
+	h := newHarness(t)
+	// Seed an old state.json that has no last_op_id field.
+	oldJSON := `{
+  "schema_version": 1,
+  "service": "web",
+  "generation": 1,
+  "active": {
+    "color": "blue",
+    "digest": "` + digest(1) + `"
+  },
+  "rollback_available": false,
+  "last_op": "deploy",
+  "last_result": "ok"
+}
+`
+	if err := os.MkdirAll(h.store.Dir+"/web", 0o700); err != nil {
+		t.Fatal(err)
+	}
+	if err := os.WriteFile(h.store.Path("web"), []byte(oldJSON), 0o600); err != nil {
+		t.Fatal(err)
+	}
+	st := h.state()
+	if st.LastOpID != "" {
+		t.Fatalf("expected empty LastOpID, got %q", st.LastOpID)
+	}
+	if st.Active == nil || st.Active.Digest != digest(1) {
+		t.Fatalf("unexpected active slot: %+v", st.Active)
+	}
+	if st.LastResult != "ok" {
+		t.Fatalf("unexpected last result: %q", st.LastResult)
+	}
+}
+
+func TestDrainAndStopHonorsCancellation(t *testing.T) {
+	h := newHarness(t)
+	svc, _ := h.cfg.Service("web")
+	if err := h.docker.Run(context.Background(), runSpecFor(h, config.Blue, digest(1))); err != nil {
+		t.Fatal(err)
+	}
+	// Router fake reports sessions > 0 forever and server is in drain.
+	h.fake.Set("bk_web", "blue", func(s *haproxytest.Server) {
+		s.Admin = 0x08 // drain
+		s.Op = 2
+		s.Scur = 10
+	})
+
+	ctx, cancel := context.WithCancel(context.Background())
+	defer cancel()
+
+	firstPoll := make(chan struct{})
+	h.fake.Hook(func(cmd string) *haproxytest.Action {
+		if strings.HasPrefix(cmd, "show stat") {
+			select {
+			case <-firstPoll:
+			default:
+				close(firstPoll)
+				cancel()
+			}
+		}
+		return nil
+	})
+
+	start := time.Now()
+	warns := h.gate.DrainAndStop(ctx, svc, config.Blue)
+	elapsed := time.Since(start)
+
+	// drainAndStop returns within one poll interval (with margin for test scheduling).
+	// Poll is 10ms, DrainTimeout is 200ms.
+	if elapsed > 100*time.Millisecond {
+		t.Fatalf("drainAndStop took %v, want return within one poll interval", elapsed)
+	}
+
+	// Warning contains "canceled"
+	if len(warns) != 1 || !strings.Contains(warns[0], "canceled") {
+		t.Fatalf("want warning containing 'canceled', got: %v", warns)
+	}
+
+	// SetState maint was NOT called
+	for _, cmd := range h.fake.Commands() {
+		if strings.Contains(cmd, "state maint") {
+			t.Fatalf("SetState maint was called: %v", cmd)
+		}
+	}
+	if b := h.fake.Get("bk_web", "blue"); b.Admin&0x01 != 0 {
+		t.Fatalf("blue server admin has maint bit set: %+v", b)
+	}
+
+	// Docker.Stop was NOT called
+	h.docker.mu.Lock()
+	for _, call := range h.docker.calls {
+		if strings.HasPrefix(call, "stop ") {
+			t.Fatalf("Docker.Stop was called: %v", call)
+		}
+	}
+	h.docker.mu.Unlock()
+
+	exists, running := h.docker.running("shiftgate-web-blue")
+	if !exists || !running {
+		t.Fatalf("shiftgate-web-blue should remain running: exists=%v running=%v", exists, running)
+	}
+}
+
+func TestDrainAndStopWithoutCancellation(t *testing.T) {
+	h := newHarness(t)
+	svc, _ := h.cfg.Service("web")
+	if err := h.docker.Run(context.Background(), runSpecFor(h, config.Blue, digest(1))); err != nil {
+		t.Fatal(err)
+	}
+	h.fake.Set("bk_web", "blue", func(s *haproxytest.Server) {
+		s.Admin = 0x08 // drain
+		s.Op = 2
+		s.Scur = 3
+	})
+	go func() {
+		time.Sleep(30 * time.Millisecond)
+		h.fake.Set("bk_web", "blue", func(s *haproxytest.Server) {
+			s.Scur = 0
+		})
+	}()
+
+	warns := h.gate.DrainAndStop(context.Background(), svc, config.Blue)
+	if len(warns) != 0 {
+		t.Fatalf("unexpected warnings: %v", warns)
+	}
+
+	// SetState maint was called
+	if b := h.fake.Get("bk_web", "blue"); b.Admin&0x01 == 0 {
+		t.Fatalf("blue server should have maint bit set: %+v", b)
+	}
+
+	// Docker.Stop was called
+	exists, running := h.docker.running("shiftgate-web-blue")
+	if !exists || running {
+		t.Fatalf("shiftgate-web-blue should be stopped: exists=%v running=%v", exists, running)
+	}
 }
 
 func setCommands(cmds []string) []string {

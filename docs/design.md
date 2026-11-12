@@ -24,8 +24,8 @@ onto shiftgate.
 
 `state.json` holds the **committed** deployment identity: `active`
 (colour and digest), `previous`, `rollback_available`, `history` (promoted
-digests, newest first, used by prune), `generation`, `last_swap_at`,
-`last_op`, `last_result` and `last_error`, and `hold`: a digest `follow`
+digests, newest first, used by prune), `generation`, `last_swap_at`, `last_op`, `last_op_id` (the operation id
+that committed or failed), `last_result` and `last_error`, and `hold`: a digest `follow`
 must not deploy (the one a rollback moved away from, or one whose followed
 deploy failed), released when the tag points at another digest or the
 digest is deployed explicitly. It also holds `pending`: the
@@ -204,6 +204,7 @@ command and never writes `state.json`.
 
 - **Drain blocks the CLI.** A long `drain_timeout` (the adopter's MCP uses
   1 h) keeps the deploy process and the service lock until drain finishes.
+  Canceling during drain exits immediately with a warning, releases the service lock, and leaves the old colour running in drain without stopping it or setting it to maintenance.
   A detached drainer is possible later; it would need its own durable
   record.
 - **HTTP/2, WebSocket and tunnel connections** stay on the draining colour

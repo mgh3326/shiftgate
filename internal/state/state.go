@@ -79,6 +79,7 @@ type State struct {
 	History           []string  `json:"history,omitempty"`
 	LastSwapAt        time.Time `json:"last_swap_at,omitzero"`
 	LastOp            string    `json:"last_op,omitempty"`
+	LastOpID          string    `json:"last_op_id,omitempty"`
 	LastResult        string    `json:"last_result,omitempty"`
 	LastError         string    `json:"last_error,omitempty"`
 	Hold              *Hold     `json:"hold,omitempty"`
