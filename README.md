@@ -153,6 +153,8 @@ services:
     pre_deploy:                    # optional one-shot command before the new colour starts
       args: ["alembic", "upgrade", "head"]   # replaces the image CMD; ENTRYPOINT is kept
       timeout: 10m                 # default 10m; on timeout the container is removed and the deploy aborts
+      env_files:                   # optional; appended after service env_files (never given to colour containers)
+        - /etc/web/migration.env
     registry_auth_file: /etc/shiftgate/registry.env  # optional; for `follow` on a private image
 
   - name: legacy-unit              # a static route: rendered, never deployed
@@ -178,10 +180,11 @@ service: shiftgate then sets no log flags, and `run_args` may set
 may not set `log`.
 
 **`pre_deploy`.** The command runs as `docker run --rm` with the new image
-(`image@digest`), the same `env_files`, `env` (with `{color}` and `{port}`
-of the colour being deployed), `network` and `run_args` as the colour, no
-published port and no restart policy. It runs after the pull and before
-anything else changes, **while the old colour still serves traffic**. A
+(`image@digest`), the colour's `env_files` followed by any
+`pre_deploy.env_files` (so migration-only env files never reach the serving
+colour containers), `env` (with `{color}` and `{port}` of the colour being
+deployed), `network` and `run_args` as the colour, no published port and no
+restart policy. It runs after the pull and before anything else changes, **while the old colour still serves traffic**. A
 database migration in `pre_deploy` must therefore be backward compatible
 with the running version (expand, deploy, then contract in a later release).
 That is the same rule a Kubernetes rolling update imposes. Move the

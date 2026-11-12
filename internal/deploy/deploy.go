@@ -720,6 +720,12 @@ func PreDeploySpec(svc *config.Service, c config.Color, digest string) docker.Ru
 		docker.LabelRole:    "pre_deploy",
 		docker.LabelDigest:  digest,
 	}
+	if svc.PreDeploy != nil && len(svc.PreDeploy.EnvFiles) > 0 {
+		envFiles := make([]string, 0, len(svc.EnvFiles)+len(svc.PreDeploy.EnvFiles))
+		envFiles = append(envFiles, svc.EnvFiles...)
+		envFiles = append(envFiles, svc.PreDeploy.EnvFiles...)
+		spec.EnvFiles = envFiles
+	}
 	port := spec.Env["PORT"]
 	expand := strings.NewReplacer("{port}", port, "{color}", string(c)).Replace
 	spec.Args = nil
