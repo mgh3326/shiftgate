@@ -4,6 +4,8 @@ import (
 	"context"
 	"errors"
 	"fmt"
+	"slices"
+	"strings"
 	"time"
 
 	"github.com/mgh3326/shiftgate/internal/config"
@@ -119,9 +121,11 @@ type PruneResult struct {
 	Warnings []string `json:"warnings,omitempty"`
 }
 
-// Prune removes local images of each service's repository except the
-// protected ones: active, previous, pending, the image of each colour
-// container, and the newest keep_digests entries of the promotion history.
+// Prune removes local images of each service's repository except the protected
+// ones: active, previous, pending, the image of each colour container, and
+// the newest keep_digests entries of the promotion history. When multiple
+// non-static services share an image repository, the protected set is the union
+// of their keep sets so pruning one service never removes images another protects.
 // It holds the host lock exclusively so no pull or run interleaves.
 func (g *Gate) Prune(ctx context.Context, only string) ([]PruneResult, error) {
 	host, err := g.Store.LockHost(true, g.hostWait())
@@ -129,39 +133,95 @@ func (g *Gate) Prune(ctx context.Context, only string) ([]PruneResult, error) {
 		return nil, lockErr(err)
 	}
 	defer host.Unlock()
-	var out []PruneResult
+
+	if only != "" {
+		if _, err := g.blueGreen(only); err != nil {
+			return nil, err
+		}
+	}
+
+	var targets []*config.Service
 	for _, s := range g.Cfg.Services {
 		if s.Static() || (only != "" && s.Name != only) {
 			continue
 		}
-		res, err := g.pruneOne(ctx, s)
+		targets = append(targets, s)
+	}
+
+	// Before removing anything, compute the protected set per image repository
+	// as the union of the keep sets of every non-static configured service with
+	// that image (regardless of the only filter). Removal for a service then
+	// skips any digest in its repository's union set.
+	//
+	// Locking order:
+	// 1. Host lock (exclusive) is held above for the duration of Prune to prevent
+	//    concurrent deploys, rollbacks, or renders.
+	// 2. Service locks needed to read each sharing service's state are acquired
+	//    in deterministic alphabetical (lexicographical) order by service name
+	//    to guarantee deadlock-free execution.
+	// 3. During image removal in pruneOne, each service lock is acquired
+	//    individually in target order.
+	unionKeep := map[string]map[string]bool{}
+	for _, target := range targets {
+		if unionKeep[target.Image] != nil {
+			continue
+		}
+		repoKeep := map[string]bool{}
+		sharers := g.sharingServices(target.Image)
+		for _, s := range sharers {
+			keep, err := g.serviceKeepSet(ctx, s)
+			if err != nil {
+				return nil, err
+			}
+			for d := range keep {
+				repoKeep[d] = true
+			}
+		}
+		unionKeep[target.Image] = repoKeep
+	}
+
+	var out []PruneResult
+	for _, s := range targets {
+		res, err := g.pruneOne(ctx, s, unionKeep[s.Image])
 		if err != nil {
 			return out, err
 		}
 		out = append(out, res)
 	}
-	if only != "" && len(out) == 0 {
-		if _, err := g.blueGreen(only); err != nil {
-			return nil, err
-		}
-	}
 	return out, nil
 }
 
-func (g *Gate) pruneOne(ctx context.Context, s *config.Service) (PruneResult, error) {
-	res := PruneResult{Service: s.Name}
+// sharingServices returns all non-static configured services that share the
+// given image repository, sorted alphabetically by service name to ensure
+// deterministic lock acquisition without deadlock.
+func (g *Gate) sharingServices(image string) []*config.Service {
+	var svcs []*config.Service
+	for _, s := range g.Cfg.Services {
+		if !s.Static() && s.Image == image {
+			svcs = append(svcs, s)
+		}
+	}
+	slices.SortFunc(svcs, func(a, b *config.Service) int {
+		return strings.Compare(a.Name, b.Name)
+	})
+	return svcs
+}
+
+func (g *Gate) serviceKeepSet(ctx context.Context, s *config.Service) (map[string]bool, error) {
 	lk, err := g.Store.LockService(s.Name)
 	if err != nil {
-		return res, lockErr(err)
+		return nil, lockErr(err)
 	}
 	defer lk.Unlock()
+
 	cur, err := g.Store.Load(s.Name)
 	if errors.Is(err, state.ErrNoState) {
-		return res, nil
+		return map[string]bool{}, nil
 	}
 	if err != nil {
-		return res, fail(CodeRecovery, "%v", err)
+		return nil, fail(CodeRecovery, "%v", err)
 	}
+
 	keep := map[string]bool{}
 	for _, sl := range []*state.Slot{cur.Active, cur.Previous} {
 		if sl != nil {
@@ -182,18 +242,37 @@ func (g *Gate) pruneOne(ctx context.Context, s *config.Service) (PruneResult, er
 	for _, c := range []config.Color{config.Blue, config.Green} {
 		ct, ok, err := g.Docker.Inspect(ctx, s.ContainerName(c))
 		if err != nil {
-			return res, fail(CodeFailed, "inspect %s: %v", s.ContainerName(c), err)
+			return nil, fail(CodeFailed, "inspect %s: %v", s.ContainerName(c), err)
 		}
 		if ok && ct.Labels[docker.LabelDigest] != "" {
 			keep[ct.Labels[docker.LabelDigest]] = true
 		}
 	}
+	return keep, nil
+}
+
+func (g *Gate) pruneOne(ctx context.Context, s *config.Service, unionKeep map[string]bool) (PruneResult, error) {
+	res := PruneResult{Service: s.Name}
+	lk, err := g.Store.LockService(s.Name)
+	if err != nil {
+		return res, lockErr(err)
+	}
+	defer lk.Unlock()
+
+	_, err = g.Store.Load(s.Name)
+	if errors.Is(err, state.ErrNoState) {
+		return res, nil
+	}
+	if err != nil {
+		return res, fail(CodeRecovery, "%v", err)
+	}
+
 	digests, err := g.Docker.ImageDigests(ctx, s.Image)
 	if err != nil {
 		return res, fail(CodeFailed, "list images of %s: %v", s.Image, err)
 	}
 	for _, d := range digests {
-		if keep[d] {
+		if unionKeep[d] {
 			res.Kept = append(res.Kept, d)
 			continue
 		}

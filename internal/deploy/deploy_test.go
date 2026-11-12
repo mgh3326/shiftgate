@@ -3,7 +3,9 @@ package deploy_test
 import (
 	"context"
 	"errors"
+	"fmt"
 	"os"
+	"path/filepath"
 	"slices"
 	"strings"
 	"testing"
@@ -11,6 +13,7 @@ import (
 
 	"github.com/mgh3326/shiftgate/internal/config"
 	"github.com/mgh3326/shiftgate/internal/deploy"
+	"github.com/mgh3326/shiftgate/internal/haproxy"
 	"github.com/mgh3326/shiftgate/internal/haproxy/haproxytest"
 	"github.com/mgh3326/shiftgate/internal/state"
 )
@@ -434,6 +437,268 @@ func TestPruneKeepsProtectedDigests(t *testing.T) {
 			t.Fatalf("protected digest %s was removed", d)
 		}
 	}
+}
+
+const testSharedYAML = `
+state_dir: %[1]s/state
+keep_digests: 2
+haproxy:
+  config: %[1]s/haproxy/haproxy.cfg
+  socket: %[2]s
+  check: ["sh", "-c", "test -s \"$1\"", "check", "{config}"]
+  reload: ["sh", "-c", "echo reload >> %[1]s/reload.marker"]
+  allowed_binds: ["127.0.0.1"]
+services:
+  - name: app1
+    image: registry.example.test/team/shared-app
+    binds: ["127.0.0.1:8080"]
+    ports: {blue: 18080, green: 18081}
+    container_port: 8080
+    health: {http: /healthz, timeout: 300ms, interval: 20ms}
+    drain_timeout: 200ms
+    stop_timeout: 1s
+  - name: app2
+    image: registry.example.test/team/shared-app
+    binds: ["127.0.0.1:8082"]
+    ports: {blue: 18082, green: 18083}
+    container_port: 8080
+    health: {http: /healthz, timeout: 300ms, interval: 20ms}
+    drain_timeout: 200ms
+    stop_timeout: 1s
+`
+
+func newSharedRepoHarness(t *testing.T) *harness {
+	t.Helper()
+	dir := t.TempDir()
+	fake := haproxytest.New(t, map[string][]string{
+		"bk_app1": {"blue", "green"},
+		"bk_app2": {"blue", "green"},
+	})
+	cfg, err := config.Parse([]byte(fmt.Sprintf(testSharedYAML, dir, fake.Path)))
+	if err != nil {
+		t.Fatal(err)
+	}
+	d := newFakeDocker()
+	h := &fakeHealth{d: d, bad: map[string]bool{}, foreign: map[int]bool{}}
+	g := &deploy.Gate{
+		Cfg:         cfg,
+		Store:       state.Store{Dir: cfg.StateDir},
+		Docker:      d,
+		Router:      haproxy.Runtime{Socket: fake.Path, Timeout: 300 * time.Millisecond},
+		Health:      h,
+		Poll:        10 * time.Millisecond,
+		FlipTimeout: 300 * time.Millisecond,
+		SyncConfig:  true,
+	}
+	return &harness{t: t, cfg: cfg, gate: g, docker: d, health: h, fake: fake, store: g.Store,
+		marker: filepath.Join(dir, "reload.marker")}
+}
+
+func TestPruneSharedRepoKeepsProtectedUnion(t *testing.T) {
+	// (a) two services sharing a repo, each protecting a different digest →
+	// pruning either (and pruning all) removes neither protected digest.
+	setup := func(t *testing.T) *harness {
+		h := newSharedRepoHarness(t)
+		if _, err := h.gate.Deploy(context.Background(), "app1", digest(1)); err != nil {
+			t.Fatalf("deploy app1: %v", err)
+		}
+		if _, err := h.gate.Deploy(context.Background(), "app2", digest(2)); err != nil {
+			t.Fatalf("deploy app2: %v", err)
+		}
+		h.docker.images[digest(77)] = true // unprotected digest
+		return h
+	}
+
+	t.Run("prune app1 only", func(t *testing.T) {
+		h := setup(t)
+		res, err := h.gate.Prune(context.Background(), "app1")
+		if err != nil {
+			t.Fatal(err)
+		}
+		if len(res) != 1 || res[0].Service != "app1" {
+			t.Fatalf("unexpected results: %+v", res)
+		}
+		if !h.docker.images[digest(1)] {
+			t.Fatalf("app1 active digest %s was removed", digest(1))
+		}
+		if !h.docker.images[digest(2)] {
+			t.Fatalf("app2 active digest %s was removed by app1 prune", digest(2))
+		}
+		if h.docker.images[digest(77)] {
+			t.Fatalf("unprotected digest %s was not removed", digest(77))
+		}
+		if !slices.Contains(res[0].Kept, digest(1)) || !slices.Contains(res[0].Kept, digest(2)) {
+			t.Fatalf("expected both digests in Kept, got %v", res[0].Kept)
+		}
+		if want := []string{digest(77)}; !slices.Equal(res[0].Removed, want) {
+			t.Fatalf("removed %v, want %v", res[0].Removed, want)
+		}
+	})
+
+	t.Run("prune app2 only", func(t *testing.T) {
+		h := setup(t)
+		res, err := h.gate.Prune(context.Background(), "app2")
+		if err != nil {
+			t.Fatal(err)
+		}
+		if len(res) != 1 || res[0].Service != "app2" {
+			t.Fatalf("unexpected results: %+v", res)
+		}
+		if !h.docker.images[digest(1)] {
+			t.Fatalf("app1 active digest %s was removed by app2 prune", digest(1))
+		}
+		if !h.docker.images[digest(2)] {
+			t.Fatalf("app2 active digest %s was removed", digest(2))
+		}
+		if h.docker.images[digest(77)] {
+			t.Fatalf("unprotected digest %s was not removed", digest(77))
+		}
+		if !slices.Contains(res[0].Kept, digest(1)) || !slices.Contains(res[0].Kept, digest(2)) {
+			t.Fatalf("expected both digests in Kept, got %v", res[0].Kept)
+		}
+		if want := []string{digest(77)}; !slices.Equal(res[0].Removed, want) {
+			t.Fatalf("removed %v, want %v", res[0].Removed, want)
+		}
+	})
+
+	t.Run("prune all", func(t *testing.T) {
+		h := setup(t)
+		res, err := h.gate.Prune(context.Background(), "")
+		if err != nil {
+			t.Fatal(err)
+		}
+		if len(res) != 2 {
+			t.Fatalf("want 2 results, got %d", len(res))
+		}
+		if !h.docker.images[digest(1)] {
+			t.Fatalf("app1 active digest %s was removed", digest(1))
+		}
+		if !h.docker.images[digest(2)] {
+			t.Fatalf("app2 active digest %s was removed", digest(2))
+		}
+		if h.docker.images[digest(77)] {
+			t.Fatalf("unprotected digest %s was not removed", digest(77))
+		}
+		// First service removed 77; both report kept union.
+		if !slices.Contains(res[0].Kept, digest(1)) || !slices.Contains(res[0].Kept, digest(2)) {
+			t.Fatalf("res[0] expected kept union, got %v", res[0].Kept)
+		}
+		if !slices.Contains(res[1].Kept, digest(1)) || !slices.Contains(res[1].Kept, digest(2)) {
+			t.Fatalf("res[1] expected kept union, got %v", res[1].Kept)
+		}
+	})
+}
+
+func TestPruneOnlyRespectsOtherServiceKeepSet(t *testing.T) {
+	// (b) prune <only> still respects the other service's keep set.
+	h := newSharedRepoHarness(t)
+	if _, err := h.gate.Deploy(context.Background(), "app1", digest(10)); err != nil {
+		t.Fatalf("deploy app1: %v", err)
+	}
+	if _, err := h.gate.Deploy(context.Background(), "app2", digest(20)); err != nil {
+		t.Fatalf("deploy app2: %v", err)
+	}
+	h.docker.images[digest(30)] = true
+
+	res, err := h.gate.Prune(context.Background(), "app1")
+	if err != nil {
+		t.Fatal(err)
+	}
+	if len(res) != 1 || res[0].Service != "app1" {
+		t.Fatalf("unexpected results: %+v", res)
+	}
+	if !slices.Contains(res[0].Kept, digest(20)) {
+		t.Fatalf("digest 20 protected by app2 was not reported in Kept: %v", res[0].Kept)
+	}
+	if !h.docker.images[digest(20)] {
+		t.Fatalf("digest 20 protected by app2 was removed by app1 prune")
+	}
+	if !h.docker.images[digest(10)] {
+		t.Fatalf("digest 10 protected by app1 was removed")
+	}
+	if h.docker.images[digest(30)] {
+		t.Fatalf("unprotected digest 30 was not removed")
+	}
+}
+
+func TestPruneSharedRepoStateLoadErrorFailsClosed(t *testing.T) {
+	// (c) state load error for a sharing service → nothing removed for that repo, error returned.
+	setup := func(t *testing.T) *harness {
+		h := newSharedRepoHarness(t)
+		if _, err := h.gate.Deploy(context.Background(), "app1", digest(1)); err != nil {
+			t.Fatalf("deploy app1: %v", err)
+		}
+		if _, err := h.gate.Deploy(context.Background(), "app2", digest(2)); err != nil {
+			t.Fatalf("deploy app2: %v", err)
+		}
+		h.docker.images[digest(77)] = true
+
+		// Corrupt app2 state file to trigger a load error (not ErrNoState).
+		if err := os.WriteFile(h.store.Path("app2"), []byte("corrupt-state"), 0644); err != nil {
+			t.Fatal(err)
+		}
+		return h
+	}
+
+	t.Run("prune only fails closed", func(t *testing.T) {
+		h := setup(t)
+		_, err := h.gate.Prune(context.Background(), "app1")
+		if err == nil {
+			t.Fatal("expected prune to fail when sharing service state is corrupt")
+		}
+		if deploy.ExitCode(err) != deploy.CodeRecovery {
+			t.Fatalf("expected CodeRecovery, got: %v", err)
+		}
+		// Nothing must be removed from the shared repository.
+		if !h.docker.images[digest(77)] {
+			t.Fatalf("digest 77 was removed despite fail-closed policy")
+		}
+		if !h.docker.images[digest(1)] || !h.docker.images[digest(2)] {
+			t.Fatal("active digests were unexpectedly removed")
+		}
+	})
+
+	t.Run("prune all fails closed", func(t *testing.T) {
+		h := setup(t)
+		_, err := h.gate.Prune(context.Background(), "")
+		if err == nil {
+			t.Fatal("expected prune to fail when sharing service state is corrupt")
+		}
+		if deploy.ExitCode(err) != deploy.CodeRecovery {
+			t.Fatalf("expected CodeRecovery, got: %v", err)
+		}
+		if !h.docker.images[digest(77)] {
+			t.Fatalf("digest 77 was removed despite fail-closed policy")
+		}
+	})
+}
+
+func TestPruneSingleServiceBehaviorUnchanged(t *testing.T) {
+	// (d) single-service repo behaviour unchanged.
+	t.Run("prune only", func(t *testing.T) {
+		h := newHarness(t)
+		for i := 1; i <= 4; i++ {
+			h.mustDeploy(i)
+		}
+		h.docker.images[digest(77)] = true
+		res, err := h.gate.Prune(context.Background(), "web")
+		if err != nil {
+			t.Fatal(err)
+		}
+		if len(res) != 1 || res[0].Service != "web" {
+			t.Fatalf("unexpected result: %+v", res)
+		}
+		removed := res[0].Removed
+		slices.Sort(removed)
+		if want := []string{digest(1), digest(2), digest(77)}; !slices.Equal(removed, want) {
+			t.Fatalf("removed %v, want %v", removed, want)
+		}
+		for _, d := range []string{digest(3), digest(4)} {
+			if !h.docker.images[d] {
+				t.Fatalf("protected digest %s was removed", d)
+			}
+		}
+	})
 }
 
 func TestRenderRefusesWildcardAndRequiresFlag(t *testing.T) {
