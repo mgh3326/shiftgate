@@ -54,9 +54,32 @@ type Container struct {
 	Labels       map[string]string
 }
 
+// ImageInfo contains Docker's image size and uncompressed layer identities.
+// Docker does not expose per-pull network bytes through `docker image inspect`.
+type ImageInfo struct {
+	Layers []string `json:"-"`
+	Bytes  int64    `json:"bytes"`
+}
+
+// PullReport compares the pulled image with the previous active image. BytesPulled
+// stays nil because Docker's inspect API reports image size, not transfer bytes.
+type PullReport struct {
+	Layers             *int   `json:"layers"`
+	LayersAlreadyThere *int   `json:"layers_already_present"`
+	LayersPulled       *int   `json:"layers_pulled"`
+	ImageBytes         *int64 `json:"image_bytes"`
+	BytesPulled        *int64 `json:"bytes_pulled"`
+	PreviousDigest     string `json:"previous_digest,omitempty"`
+	PreviousLayers     *int   `json:"previous_layers"`
+	PreviousImageBytes *int64 `json:"previous_image_bytes"`
+	PreviousShared     *int   `json:"previous_shared_layers"`
+	Warning            string `json:"warning,omitempty"`
+}
+
 // Engine is the container runtime surface the deploy logic needs.
 type Engine interface {
 	Pull(ctx context.Context, ref string) error
+	ImageInfo(ctx context.Context, ref string) (ImageInfo, error)
 	Run(ctx context.Context, spec RunSpec) error
 	// RunOnce runs a OneShot spec to completion, writing its combined
 	// output to out. A non-zero exit is an error. When ctx ends first the
@@ -94,6 +117,53 @@ func (c CLI) run(ctx context.Context, args ...string) (string, error) {
 func (c CLI) Pull(ctx context.Context, ref string) error {
 	_, err := c.run(ctx, "pull", "--quiet", ref)
 	return err
+}
+
+func (c CLI) ImageInfo(ctx context.Context, ref string) (ImageInfo, error) {
+	out, err := c.run(ctx, "image", "inspect", "--format", "{{json .}}", ref)
+	if err != nil {
+		return ImageInfo{}, err
+	}
+	var raw struct {
+		Size   int64 `json:"Size"`
+		RootFS struct {
+			Layers []string `json:"Layers"`
+		} `json:"RootFS"`
+	}
+	if err := json.Unmarshal([]byte(out), &raw); err != nil {
+		return ImageInfo{}, fmt.Errorf("docker image inspect %s: %w", ref, err)
+	}
+	return ImageInfo{Layers: raw.RootFS.Layers, Bytes: raw.Size}, nil
+}
+
+// ComparePull reports the new image's layer count, layers shared with the
+// previous active image, and Docker's total image sizes. Transfer bytes are
+// intentionally unknown: Docker's CLI does not report them after a quiet pull.
+func ComparePull(current ImageInfo, previous *ImageInfo) PullReport {
+	layers := len(current.Layers)
+	r := PullReport{Layers: &layers}
+	sz := current.Bytes
+	r.ImageBytes = &sz
+	if previous == nil {
+		return r
+	}
+	prevCount, prevSize := len(previous.Layers), previous.Bytes
+	r.PreviousLayers, r.PreviousImageBytes = &prevCount, &prevSize
+	prev := make(map[string]bool, len(previous.Layers))
+	for _, layer := range previous.Layers {
+		prev[layer] = true
+	}
+	shared := 0
+	for _, layer := range current.Layers {
+		if prev[layer] {
+			shared++
+		}
+	}
+	pulled := len(current.Layers) - shared
+	r.LayersAlreadyThere = &shared
+	r.LayersPulled = &pulled
+	r.PreviousShared = &shared
+	return r
 }
 
 // ArgList builds the docker run argument list (exported for tests and docs).

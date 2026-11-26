@@ -240,6 +240,39 @@ func printResult(w io.Writer, r *deploy.Result) {
 		from = fmt.Sprintf("%s@%s", r.From.Color, r.From.Digest)
 	}
 	fmt.Fprintf(w, "%s %s: %s → %s@%s (op %s)\n", r.Op, r.Service, from, r.To.Color, r.To.Digest, r.OpID)
+	if p := r.PullReport; p != nil {
+		layers := "unknown"
+		if p.Layers != nil {
+			layers = fmt.Sprint(*p.Layers)
+		}
+		fmt.Fprintf(w, "  pull: %s layers; bytes pulled %s; image size %s", layers, pullBytes(p.BytesPulled), pullBytes(p.ImageBytes))
+		if p.LayersAlreadyThere == nil {
+			fmt.Fprint(w, "; previous active comparison unknown")
+		} else {
+			fmt.Fprintf(w, "; %d layers already present, %d new", *p.LayersAlreadyThere, *p.LayersPulled)
+		}
+		if p.PreviousDigest != "" {
+			fmt.Fprintf(w, "; previous active %s: ", p.PreviousDigest)
+			if p.PreviousLayers != nil {
+				fmt.Fprintf(w, "%d layers, %s", *p.PreviousLayers, pullBytes(p.PreviousImageBytes))
+			} else {
+				fmt.Fprint(w, "metadata unknown")
+			}
+		} else {
+			fmt.Fprint(w, "; previous active image: none")
+		}
+		fmt.Fprintln(w)
+	}
+	for _, warning := range r.Warnings {
+		fmt.Fprintf(w, "  warning: %s\n", warning)
+	}
+}
+
+func pullBytes(n *int64) string {
+	if n == nil {
+		return "unknown"
+	}
+	return fmt.Sprintf("%d bytes", *n)
 }
 
 func printFollow(w io.Writer, r *deploy.FollowResult) {

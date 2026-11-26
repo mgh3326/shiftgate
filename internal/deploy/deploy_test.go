@@ -2,6 +2,7 @@ package deploy_test
 
 import (
 	"context"
+	"encoding/json"
 	"errors"
 	"fmt"
 	"os"
@@ -13,6 +14,7 @@ import (
 
 	"github.com/mgh3326/shiftgate/internal/config"
 	"github.com/mgh3326/shiftgate/internal/deploy"
+	"github.com/mgh3326/shiftgate/internal/docker"
 	"github.com/mgh3326/shiftgate/internal/haproxy"
 	"github.com/mgh3326/shiftgate/internal/haproxy/haproxytest"
 	"github.com/mgh3326/shiftgate/internal/state"
@@ -73,6 +75,36 @@ func TestDeployHealthyFlipsDrainsAndKeepsOld(t *testing.T) {
 	if !strings.Contains(string(cfgData), "server green 127.0.0.1:18081 check\n") ||
 		!strings.Contains(string(cfgData), "server blue 127.0.0.1:18080 check disabled") {
 		t.Fatalf("config file not synced to committed state:\n%s", cfgData)
+	}
+}
+
+func TestDeployReportsPullAndWarnsOnFullRepull(t *testing.T) {
+	h := newHarness(t)
+	h.mustDeploy(1)
+	h.docker.mu.Lock()
+	h.docker.imageInfo[digest(1)] = docker.ImageInfo{Layers: []string{"base-a", "base-b"}, Bytes: 1000}
+	h.docker.imageInfo[digest(2)] = docker.ImageInfo{Layers: []string{"new-a", "new-b"}, Bytes: 1200}
+	h.docker.mu.Unlock()
+	res, err := h.gate.Deploy(context.Background(), "web", digest(2))
+	if err != nil {
+		t.Fatalf("full re-pull should warn without failing: %v", err)
+	}
+	if res.PullReport == nil || res.PullReport.Layers == nil || *res.PullReport.Layers != 2 || res.PullReport.LayersPulled == nil || *res.PullReport.LayersPulled != 2 || res.PullReport.BytesPulled != nil {
+		t.Fatalf("pull report: %+v", res.PullReport)
+	}
+	if len(res.Warnings) != 1 || !strings.Contains(res.Warnings[0], "high image re-pull") {
+		t.Fatalf("warnings: %v", res.Warnings)
+	}
+	st := h.state()
+	if st.LastPullReport == nil || st.LastPullReport.Warning == "" {
+		t.Fatalf("state pull report: %+v", st.LastPullReport)
+	}
+	var record state.SwapRecord
+	if err := json.Unmarshal([]byte(h.swaps()[1]), &record); err != nil {
+		t.Fatal(err)
+	}
+	if record.PullReport == nil || record.PullReport.LayersPulled == nil || *record.PullReport.LayersPulled != 2 {
+		t.Fatalf("swap report: %+v", record.PullReport)
 	}
 }
 

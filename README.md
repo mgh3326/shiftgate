@@ -120,6 +120,7 @@ Exit codes:
 ```yaml
 state_dir: /var/lib/shiftgate      # state.json, swaps.log and locks per service
 keep_digests: 3                    # prune keeps this many recent promoted digests per service
+pull_warn_share: 0.8               # warn when over 80% of image layers are new
 log: {max_size: 10m, max_file: 3}  # json-file log limits of every container (default 10m x 3)
 haproxy:
   config: /etc/haproxy/haproxy.cfg # generated file (shiftgate owns it)
@@ -167,6 +168,23 @@ services:
 `--network`, `-p`, `--env-file`, `-e`, `--restart`, `-d`, `--rm`,
 `--privileged`, `--entrypoint`, `--cap-add`, `--log-driver`, `--log-opt` and
 similar.
+
+## Image layout and pull reports
+
+Put stable dependencies in lower image layers and copy frequently changing
+application code afterward. Avoid a recursive ownership change such as
+`RUN chown -R ...` after copying the code; use `COPY --chown` for the files
+that need it. Docker reuses identical lower layers, while a later recursive
+change creates another large layer and can make a small code deploy transfer
+almost the whole image.
+
+Each deploy reports the image's layer count, layers shared with the previous
+active image, Docker's total image size, and the previous image's layer count
+and size. Docker's quiet pull and image inspection do not expose per-deploy
+network bytes, so `bytes pulled` is reported as unknown. `pull_warn_share`
+defaults to `0.8`; when a previous active image is available, shiftgate warns
+if the count of new layers exceeds that share of the new image's layers. The
+warning does not fail the deploy.
 
 **Logs.** Every container shiftgate runs gets `--log-driver json-file
 --log-opt max-size=<max_size> --log-opt max-file=<max_file>`. The driver is
