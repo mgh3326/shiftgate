@@ -6,6 +6,7 @@ import (
 	"bytes"
 	"errors"
 	"fmt"
+	"math"
 	"net"
 	"net/netip"
 	"os"
@@ -363,7 +364,7 @@ func (f *File) validate() error {
 	if f.KeepDigests < 1 || f.KeepDigests > MaxKeepDigests {
 		bad("keep_digests must be 1-%d (the promotion history holds %d entries)", MaxKeepDigests, MaxKeepDigests)
 	}
-	if f.PullWarnShare <= 0 || f.PullWarnShare > 1 {
+	if math.IsNaN(f.PullWarnShare) || f.PullWarnShare <= 0 || f.PullWarnShare > 1 {
 		bad("pull_warn_share must be greater than 0 and at most 1")
 	}
 	validLog := func(where string, l LogOptions) {

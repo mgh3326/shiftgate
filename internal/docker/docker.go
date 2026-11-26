@@ -120,7 +120,7 @@ func (c CLI) Pull(ctx context.Context, ref string) error {
 }
 
 func (c CLI) ImageInfo(ctx context.Context, ref string) (ImageInfo, error) {
-	out, err := c.run(ctx, "image", "inspect", "--size", "--format", "{{json .}}", ref)
+	out, err := c.run(ctx, "image", "inspect", "--format", "{{json .}}", ref)
 	if err != nil {
 		return ImageInfo{}, err
 	}

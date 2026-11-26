@@ -51,6 +51,7 @@ func TestRejects(t *testing.T) {
 		"bind on colour port":          {`binds: ["127.0.0.1:8080"]`, `binds: ["127.0.0.1:18080"]`, "collides"},
 		"keep_digests over cap":        {`haproxy:`, "keep_digests: 51\nhaproxy:", "keep_digests must be 1-50"},
 		"pull warn share over one":     {`haproxy:`, "pull_warn_share: 1.1\nhaproxy:", "pull_warn_share must be greater"},
+		"pull warn share nan":          {`haproxy:`, "pull_warn_share: .nan\nhaproxy:", "pull_warn_share must be greater"},
 		"negative timeout":             {`haproxy:`, "haproxy:\n  timeouts: {client: -1s}", "must not be negative"},
 		"sub-ms check interval":        {`health: {http: /healthz}`, "health: {http: /healthz}\n    check: {inter: 500us}", "at least 1ms"},
 		"empty service entry":          {`services:`, "services:\n  - ~", "services[0] is empty"},
