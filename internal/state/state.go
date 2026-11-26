@@ -18,6 +18,7 @@ import (
 	"time"
 
 	"github.com/mgh3326/shiftgate/internal/config"
+	"github.com/mgh3326/shiftgate/internal/docker"
 )
 
 // SchemaVersion is written into every state file.
@@ -46,12 +47,13 @@ const (
 
 // Intent is the journal of an operation that has not committed yet.
 type Intent struct {
-	OpID      string    `json:"op_id"`
-	Op        string    `json:"op"` // deploy | rollback
-	Phase     Phase     `json:"phase"`
-	From      *Slot     `json:"from,omitempty"`
-	To        Slot      `json:"to"`
-	StartedAt time.Time `json:"started_at"`
+	OpID       string             `json:"op_id"`
+	Op         string             `json:"op"` // deploy | rollback
+	Phase      Phase              `json:"phase"`
+	From       *Slot              `json:"from,omitempty"`
+	To         Slot               `json:"to"`
+	StartedAt  time.Time          `json:"started_at"`
+	PullReport *docker.PullReport `json:"pull_report,omitempty"`
 	// OpLog is the file holding captured pre_deploy output, if any.
 	OpLog string `json:"op_log,omitempty"`
 }
@@ -70,20 +72,21 @@ type Hold struct {
 // State is state.json. Active/Previous are committed truth; Pending is the
 // journal of an operation that has not committed (nil when idle).
 type State struct {
-	SchemaVersion     int       `json:"schema_version"`
-	Service           string    `json:"service"`
-	Generation        int64     `json:"generation"`
-	Active            *Slot     `json:"active,omitempty"`
-	Previous          *Slot     `json:"previous,omitempty"`
-	RollbackAvailable bool      `json:"rollback_available"`
-	History           []string  `json:"history,omitempty"`
-	LastSwapAt        time.Time `json:"last_swap_at,omitzero"`
-	LastOp            string    `json:"last_op,omitempty"`
-	LastOpID          string    `json:"last_op_id,omitempty"`
-	LastResult        string    `json:"last_result,omitempty"`
-	LastError         string    `json:"last_error,omitempty"`
-	Hold              *Hold     `json:"hold,omitempty"`
-	Pending           *Intent   `json:"pending,omitempty"`
+	SchemaVersion     int                `json:"schema_version"`
+	Service           string             `json:"service"`
+	Generation        int64              `json:"generation"`
+	Active            *Slot              `json:"active,omitempty"`
+	Previous          *Slot              `json:"previous,omitempty"`
+	RollbackAvailable bool               `json:"rollback_available"`
+	History           []string           `json:"history,omitempty"`
+	LastSwapAt        time.Time          `json:"last_swap_at,omitzero"`
+	LastOp            string             `json:"last_op,omitempty"`
+	LastOpID          string             `json:"last_op_id,omitempty"`
+	LastResult        string             `json:"last_result,omitempty"`
+	LastError         string             `json:"last_error,omitempty"`
+	LastPullReport    *docker.PullReport `json:"last_pull_report,omitempty"`
+	Hold              *Hold              `json:"hold,omitempty"`
+	Pending           *Intent            `json:"pending,omitempty"`
 }
 
 // PushHistory records a successfully promoted digest, newest first.
@@ -184,18 +187,19 @@ func syncDir(dir string) error {
 
 // SwapRecord is one line of swaps.log.
 type SwapRecord struct {
-	Time       time.Time    `json:"time"`
-	OpID       string       `json:"op_id"`
-	Service    string       `json:"service"`
-	Op         string       `json:"op"`
-	FromColor  config.Color `json:"from_color,omitempty"`
-	ToColor    config.Color `json:"to_color"`
-	FromDigest string       `json:"from_digest,omitempty"`
-	ToDigest   string       `json:"to_digest"`
-	Result     string       `json:"result"`
-	Error      string       `json:"error,omitempty"`
-	Warnings   []string     `json:"warnings,omitempty"`
-	OpLog      string       `json:"op_log,omitempty"`
+	Time       time.Time          `json:"time"`
+	OpID       string             `json:"op_id"`
+	Service    string             `json:"service"`
+	Op         string             `json:"op"`
+	FromColor  config.Color       `json:"from_color,omitempty"`
+	ToColor    config.Color       `json:"to_color"`
+	FromDigest string             `json:"from_digest,omitempty"`
+	ToDigest   string             `json:"to_digest"`
+	Result     string             `json:"result"`
+	Error      string             `json:"error,omitempty"`
+	Warnings   []string           `json:"warnings,omitempty"`
+	OpLog      string             `json:"op_log,omitempty"`
+	PullReport *docker.PullReport `json:"pull_report,omitempty"`
 }
 
 // AppendSwap appends one JSON line to svc's swap log (audit, not authority).

@@ -54,11 +54,12 @@ func (d Duration) D() time.Duration { return time.Duration(d) }
 
 // File is the whole services.yaml.
 type File struct {
-	StateDir    string     `yaml:"state_dir"`
-	KeepDigests int        `yaml:"keep_digests"`
-	Log         LogOptions `yaml:"log"`
-	HAProxy     HAProxy    `yaml:"haproxy"`
-	Services    []*Service `yaml:"services"`
+	StateDir      string     `yaml:"state_dir"`
+	KeepDigests   int        `yaml:"keep_digests"`
+	PullWarnShare float64    `yaml:"pull_warn_share"`
+	Log           LogOptions `yaml:"log"`
+	HAProxy       HAProxy    `yaml:"haproxy"`
+	Services      []*Service `yaml:"services"`
 }
 
 // LogOptions bounds the json-file logs of every container shiftgate runs.
@@ -241,6 +242,9 @@ func (f *File) defaults() {
 	if f.KeepDigests == 0 {
 		f.KeepDigests = 3
 	}
+	if f.PullWarnShare == 0 {
+		f.PullWarnShare = DefaultPullWarnShare
+	}
 	if f.Log.Driver == "" {
 		f.Log.Driver = LogJSONFile
 	}
@@ -347,6 +351,9 @@ var managedRunFlags = []string{
 // MaxKeepDigests is the promotion history length kept in state.json.
 const MaxKeepDigests = 50
 
+// DefaultPullWarnShare warns when more than 80% of image layers are new.
+const DefaultPullWarnShare = 0.8
+
 func (f *File) validate() error {
 	var errs []error
 	bad := func(format string, a ...any) { errs = append(errs, fmt.Errorf(format, a...)) }
@@ -355,6 +362,9 @@ func (f *File) validate() error {
 	}
 	if f.KeepDigests < 1 || f.KeepDigests > MaxKeepDigests {
 		bad("keep_digests must be 1-%d (the promotion history holds %d entries)", MaxKeepDigests, MaxKeepDigests)
+	}
+	if f.PullWarnShare <= 0 || f.PullWarnShare > 1 {
+		bad("pull_warn_share must be greater than 0 and at most 1")
 	}
 	validLog := func(where string, l LogOptions) {
 		if l.Driver != LogJSONFile && l.Driver != LogDaemon {

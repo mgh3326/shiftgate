@@ -134,12 +134,13 @@ func (g *Gate) hostWait() time.Duration {
 
 // Result describes a committed promotion.
 type Result struct {
-	Service  string      `json:"service"`
-	Op       string      `json:"op"`
-	OpID     string      `json:"op_id"`
-	From     *state.Slot `json:"from,omitempty"`
-	To       state.Slot  `json:"to"`
-	Warnings []string    `json:"warnings,omitempty"`
+	Service    string             `json:"service"`
+	Op         string             `json:"op"`
+	OpID       string             `json:"op_id"`
+	From       *state.Slot        `json:"from,omitempty"`
+	To         state.Slot         `json:"to"`
+	Warnings   []string           `json:"warnings,omitempty"`
+	PullReport *docker.PullReport `json:"pull_report,omitempty"`
 }
 
 func (g *Gate) blueGreen(name string) (*config.Service, error) {
@@ -284,6 +285,7 @@ func (g *Gate) deployLocked(ctx context.Context, ss *session, digest string) (*R
 	if err := g.Docker.Pull(ctx, ref); err != nil {
 		return nil, g.abort(ss, "pull_failed", err, false)
 	}
+	g.reportPull(ctx, ss, ref)
 	// pre_deploy runs while the old colour serves and before the target
 	// slot is touched, so a failure leaves routing and rollback intact.
 	if svc.PreDeploy != nil {
@@ -401,6 +403,9 @@ func (g *Gate) abort(ss *session, result string, cause error, stopTarget bool) e
 	}
 	cur.Pending = nil
 	cur.LastOp, cur.LastOpID, cur.LastResult, cur.LastError = op.Op, op.OpID, result, cause.Error()
+	if op.PullReport != nil {
+		cur.LastPullReport = op.PullReport
+	}
 	ss.aborted, ss.abortedOp = result, op.OpID
 	if err := g.Store.Save(cur); err != nil {
 		return fail(CodeRecovery, "%s: %v; and clearing the intent failed: %v", result, cause, err)
@@ -411,7 +416,7 @@ func (g *Gate) abort(ss *session, result string, cause error, stopTarget bool) e
 
 func (g *Gate) audit(svc *config.Service, op *state.Intent, result string, cause error, warnings []string) {
 	r := state.SwapRecord{Time: g.now(), OpID: op.OpID, Service: svc.Name, Op: op.Op,
-		ToColor: op.To.Color, ToDigest: op.To.Digest, Result: result, Warnings: warnings, OpLog: op.OpLog}
+		ToColor: op.To.Color, ToDigest: op.To.Digest, Result: result, Warnings: warnings, OpLog: op.OpLog, PullReport: op.PullReport}
 	if op.From != nil {
 		r.FromColor, r.FromDigest = op.From.Color, op.From.Digest
 	}
@@ -421,6 +426,75 @@ func (g *Gate) audit(svc *config.Service, op *state.Intent, result string, cause
 	if err := g.Store.AppendSwap(r); err != nil {
 		g.logf("%s: swap log append failed (the operation result stands): %v", svc.Name, err)
 	}
+}
+
+// reportPull gathers best-effort image metadata after the pull. Observability
+// must never change the deploy result.
+func (g *Gate) reportPull(ctx context.Context, ss *session, ref string) {
+	cur, err := g.Docker.ImageInfo(ctx, ref)
+	if err != nil {
+		g.logf("%s: pull report unavailable: %v", ss.svc.Name, err)
+		report := docker.PullReport{}
+		if ss.cur.Active != nil {
+			report.PreviousDigest = ss.cur.Active.Digest
+		}
+		ss.cur.Pending.PullReport = &report
+		if saveErr := g.Store.Save(ss.cur); saveErr != nil {
+			g.logf("%s: pull report state write failed (deploy continues): %v", ss.svc.Name, saveErr)
+		}
+		g.logf("%s: pull report: layers unknown; bytes pulled unknown; image size unknown; previous image comparison unknown", ss.svc.Name)
+		return
+	}
+	var previous *docker.ImageInfo
+	if ss.cur.Active != nil {
+		oldRef := ss.svc.Image + "@" + ss.cur.Active.Digest
+		info, ierr := g.Docker.ImageInfo(ctx, oldRef)
+		if ierr != nil {
+			g.logf("%s: previous image pull comparison unavailable: %v", ss.svc.Name, ierr)
+		} else {
+			previous = &info
+		}
+	}
+	report := docker.ComparePull(cur, previous)
+	if ss.cur.Active != nil {
+		// Keep the previous identity even if its metadata is unavailable.
+		report.PreviousDigest = ss.cur.Active.Digest
+	}
+	share := g.Cfg.PullWarnShare
+	if previous != nil && report.Layers != nil && *report.Layers > 0 && report.LayersPulled != nil &&
+		float64(*report.LayersPulled)/float64(*report.Layers) > share {
+		report.Warning = fmt.Sprintf("high image re-pull: %d/%d layers are new (threshold %.0f%%)", *report.LayersPulled, *report.Layers, share*100)
+	}
+	ss.cur.Pending.PullReport = &report
+	if err := g.Store.Save(ss.cur); err != nil {
+		g.logf("%s: pull report state write failed (deploy continues): %v", ss.svc.Name, err)
+	}
+	layers := "unknown"
+	if report.Layers != nil {
+		layers = fmt.Sprint(*report.Layers)
+	}
+	line := fmt.Sprintf("%s: pull report: %s layers; bytes pulled %s; image size %s", ss.svc.Name, layers, formatBytes(report.BytesPulled), formatBytes(report.ImageBytes))
+	if report.LayersAlreadyThere != nil {
+		line += fmt.Sprintf("; %d already present, %d new", *report.LayersAlreadyThere, *report.LayersPulled)
+	}
+	if report.PreviousLayers != nil {
+		line += fmt.Sprintf("; previous active: %d layers, image size %s", *report.PreviousLayers, formatBytes(report.PreviousImageBytes))
+	} else if report.PreviousDigest != "" {
+		line += "; previous active image comparison unknown"
+	} else {
+		line += "; previous active image none"
+	}
+	g.logf("%s", line)
+	if report.Warning != "" {
+		g.logf("%s: warning: %s", ss.svc.Name, report.Warning)
+	}
+}
+
+func formatBytes(n *int64) string {
+	if n == nil {
+		return "unknown"
+	}
+	return fmt.Sprintf("%d bytes", *n)
 }
 
 // waitState polls the runtime API until cond holds for server or the flip
@@ -510,6 +584,7 @@ func (g *Gate) commit(ctx context.Context, ss *session) (*Result, error) {
 	cur.Generation++
 	cur.LastSwapAt = g.now()
 	cur.LastOp, cur.LastOpID, cur.LastResult, cur.LastError = op.Op, op.OpID, "ok", ""
+	cur.LastPullReport = op.PullReport
 	switch {
 	case op.Op == "rollback" && op.From != nil:
 		// follow must not bring back the digest that was just rolled back.
@@ -523,7 +598,10 @@ func (g *Gate) commit(ctx context.Context, ss *session) (*Result, error) {
 			op.Op, svc.Name, to.Color, err, svc.Name)
 	}
 	g.logf("%s: %s now serves %s", svc.Name, to.Color, short(to.Digest))
-	res := &Result{Service: svc.Name, Op: op.Op, OpID: op.OpID, From: op.From, To: to}
+	res := &Result{Service: svc.Name, Op: op.Op, OpID: op.OpID, From: op.From, To: to, PullReport: op.PullReport}
+	if op.PullReport != nil && op.PullReport.Warning != "" {
+		res.Warnings = append(res.Warnings, op.PullReport.Warning)
+	}
 	if g.SyncConfig {
 		if err := g.syncConfig(ctx); err != nil {
 			res.Warnings = append(res.Warnings, "config file not refreshed (runtime routing is correct; run `shiftgate render --no-reload`): "+err.Error())

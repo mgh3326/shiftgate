@@ -25,7 +25,8 @@ import (
 type fakeDocker struct {
 	mu         sync.Mutex
 	containers map[string]*fakeCtr
-	images     map[string]bool // digest
+	images     map[string]bool             // digest
+	imageInfo  map[string]docker.ImageInfo // digest
 	calls      []string
 	pullGate   chan struct{} // when non-nil, Pull blocks until closed
 	pullEnter  chan struct{} // signalled when Pull starts
@@ -54,7 +55,7 @@ type fakeCtr struct {
 }
 
 func newFakeDocker() *fakeDocker {
-	return &fakeDocker{containers: map[string]*fakeCtr{}, images: map[string]bool{}, failRemove: map[string]bool{}}
+	return &fakeDocker{containers: map[string]*fakeCtr{}, images: map[string]bool{}, imageInfo: map[string]docker.ImageInfo{}, failRemove: map[string]bool{}}
 }
 
 func (d *fakeDocker) record(s string) {
@@ -79,6 +80,20 @@ func (d *fakeDocker) Pull(ctx context.Context, ref string) error {
 	d.images[digest] = true
 	d.mu.Unlock()
 	return nil
+}
+
+func (d *fakeDocker) ImageInfo(ctx context.Context, ref string) (docker.ImageInfo, error) {
+	_, digest, ok := strings.Cut(ref, "@")
+	if !ok {
+		return docker.ImageInfo{}, fmt.Errorf("invalid image ref %q", ref)
+	}
+	d.mu.Lock()
+	defer d.mu.Unlock()
+	info, ok := d.imageInfo[digest]
+	if !ok {
+		return docker.ImageInfo{}, fmt.Errorf("image metadata missing for %s", digest)
+	}
+	return info, nil
 }
 
 func (d *fakeDocker) Run(ctx context.Context, spec docker.RunSpec) error {

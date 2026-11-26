@@ -25,3 +25,13 @@ func TestArgListOneShotAndLogOpts(t *testing.T) {
 		t.Fatalf("got %v\nwant %v", got, want)
 	}
 }
+
+func TestComparePullReportsSharedLayersAndUnknownTransferBytes(t *testing.T) {
+	previous := ImageInfo{Layers: []string{"base", "deps"}, Bytes: 900}
+	report := ComparePull(ImageInfo{Layers: []string{"base", "deps", "app"}, Bytes: 1200}, &previous)
+	if report.Layers == nil || *report.Layers != 3 || report.LayersAlreadyThere == nil || *report.LayersAlreadyThere != 2 ||
+		report.LayersPulled == nil || *report.LayersPulled != 1 || report.BytesPulled != nil ||
+		report.PreviousLayers == nil || *report.PreviousLayers != 2 || report.PreviousShared == nil || *report.PreviousShared != 2 {
+		t.Fatalf("report: %+v", report)
+	}
+}
