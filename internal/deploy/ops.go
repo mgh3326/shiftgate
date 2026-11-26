@@ -282,6 +282,9 @@ func (g *Gate) pruneOne(ctx context.Context, s *config.Service, unionKeep map[st
 		}
 		res.Removed = append(res.Removed, d)
 	}
+	if len(digests) != 0 && len(res.Removed) == 0 {
+		res.Warnings = append(res.Warnings, fmt.Sprintf("found %d local image digests for %s, none removed", len(digests), s.Image))
+	}
 	return res, nil
 }
 

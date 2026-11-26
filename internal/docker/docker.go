@@ -211,27 +211,63 @@ func parseInspect(name, out string) (Container, bool, error) {
 }
 
 func (c CLI) ImageDigests(ctx context.Context, repo string) ([]string, error) {
-	out, err := c.run(ctx, "image", "ls", "--digests", "--format", "{{.Repository}} {{.Digest}}", repo)
+	// The classic image store omits digest-only pulls from the default list.
+	// Include all images and read repository membership from RepoDigests.
+	out, err := c.run(ctx, "image", "ls", "-a", "-q", "--no-trunc")
 	if err != nil {
 		return nil, err
 	}
 	var ds []string
-	seen := map[string]bool{}
-	for _, line := range strings.Split(strings.TrimSpace(out), "\n") {
-		r, d, ok := strings.Cut(strings.TrimSpace(line), " ")
-		if !ok || r != repo || !strings.HasPrefix(d, "sha256:") || seen[d] {
+	seenIDs, seenDigests := map[string]bool{}, map[string]bool{}
+	for _, id := range strings.Fields(out) {
+		if seenIDs[id] {
 			continue
 		}
-		seen[d] = true
-		ds = append(ds, d)
+		seenIDs[id] = true
+		refsJSON, err := c.run(ctx, "image", "inspect", "--format", "{{json .RepoDigests}}", id)
+		if err != nil {
+			return nil, fmt.Errorf("inspect image %s: %w", id, err)
+		}
+		var refs []string
+		if err := json.Unmarshal([]byte(refsJSON), &refs); err != nil {
+			return nil, fmt.Errorf("decode repository digests for image %s: %w", id, err)
+		}
+		for _, ref := range refs {
+			r, d, ok := strings.Cut(ref, "@")
+			if !ok || r != repo || !strings.HasPrefix(d, "sha256:") || seenDigests[d] {
+				continue
+			}
+			seenDigests[d] = true
+			ds = append(ds, d)
+		}
 	}
 	return ds, nil
 }
 
-// RemoveImage removes one image reference without force: Docker refuses when
-// a container still uses it, which is the behaviour prune relies on.
+// RemoveImage removes one image reference without force.
 func (c CLI) RemoveImage(ctx context.Context, ref string) error {
-	_, err := c.run(ctx, "image", "rm", ref)
+	// Docker can untag a reference even when a container uses the same image
+	// through another reference. Check all container states before untagging.
+	out, err := c.run(ctx, "container", "ls", "--all", "--quiet", "--filter", "ancestor="+ref)
+	if err != nil {
+		return err
+	}
+	if containers := strings.Fields(out); len(containers) != 0 {
+		id, err := c.run(ctx, "image", "inspect", "--format", "{{.Id}}", ref)
+		if err != nil {
+			return err
+		}
+		// The ancestor filter also matches descendant images.
+		args := append([]string{"container", "inspect", "--format", "{{.Image}}"}, containers...)
+		images, err := c.run(ctx, args...)
+		if err != nil {
+			return err
+		}
+		if id := strings.TrimSpace(id); slices.Contains(strings.Fields(images), id) {
+			return fmt.Errorf("image %s is in use by a container", id)
+		}
+	}
+	_, err = c.run(ctx, "image", "rm", ref)
 	return err
 }
 
